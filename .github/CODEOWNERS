@@ -1,0 +1,39 @@
+# Each folder is owned by its domain owner; PRs touching it require her approval.
+# TODO(Devora): replace the <...> placeholders with each teammate's GitHub username before enabling branch protection.
+
+# Default: team lead
+*                   @Devora9249
+
+# Contracts: change requires approval from all six
+/contracts/         @Devora9249 <raizy-github> <racheli-github> <leah-github> <chani-github> <chaya-github>
+
+# Ingestion — Devora
+/src/kc/ingestion/  @Devora9249
+/fixtures/          @Devora9249
+/tests/ingestion/   @Devora9249
+
+# Storage & Indexing — Raizy
+/src/kc/db/         <raizy-github>
+/src/kc/indexing/   <raizy-github>
+/tests/db/          <raizy-github>
+/tests/indexing/    <raizy-github>
+
+# Search & Ranking — Racheli
+/src/kc/retrieval/  <racheli-github>
+/tests/retrieval/   <racheli-github>
+
+# Generation, Agent & API — Leah
+/src/kc/generation/ <leah-github>
+/src/kc/agent/      <leah-github>
+/src/kc/api/        <leah-github>
+/tests/generation/  <leah-github>
+/tests/agent/       <leah-github>
+/tests/api/         <leah-github>
+
+# Platform & UI — Chani
+/ui/                <chani-github>
+/infra/             <chani-github>
+/.github/workflows/ <chani-github>
+
+# Evaluation & Quality — Chaya
+/eval/              <chaya-github>
