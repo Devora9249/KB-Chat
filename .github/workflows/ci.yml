@@ -1,0 +1,54 @@
+# CI for kc-assistant: lint, format check, type check and tests on every PR to main and every push to main.
+# Owner: Platform & UI (Chani). Tool configuration lives in pyproject.toml — this file only invokes the tools.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: the workflow only needs to read the repo.
+permissions:
+  contents: read
+
+# A new push to the same PR/branch cancels the run that is still in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Python code folders. Passed explicitly to ruff because recent ruff versions also
+  # format Python blocks inside Markdown files (e.g. CLAUDE.md), which is not code we ship.
+  PY_PATHS: src contracts tests eval
+
+jobs:
+  checks:
+    name: Lint, types & tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies (from uv.lock)
+        run: uv sync --locked
+
+      - name: Ruff lint
+        run: uv run ruff check $PY_PATHS
+
+      - name: Ruff format check
+        run: uv run ruff format --check $PY_PATHS
+
+      - name: Mypy (strict, targets from pyproject.toml)
+        run: uv run mypy
+
+      - name: Pytest
+        run: uv run pytest
