@@ -30,3 +30,12 @@ class DbSettings(BaseSettings):
         if not value.get_secret_value().startswith(REQUIRED_SCHEME):
             raise ValueError(f"DATABASE_URL must start with '{REQUIRED_SCHEME}'")
         return value
+
+
+def load_db_settings() -> DbSettings:
+    """Load settings from the environment / `.env`.
+
+    mypy cannot see that pydantic-settings fills required fields from the environment,
+    so the single type-ignore lives here instead of at every call site.
+    """
+    return DbSettings()  # type: ignore[call-arg]

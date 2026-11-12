@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 # Each domain owner adds her runtime dependencies with `uv add <pkg>` (stack list only, see CLAUDE.md).
 dependencies = [
+    "alembic>=1.13",
     "psycopg[binary]>=3.2",
     "pydantic>=2.7",
     "pydantic-settings>=2.4",
