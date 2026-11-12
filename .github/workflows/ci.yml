@@ -27,6 +27,9 @@ jobs:
     name: Lint, types & tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Job-level env: every step (pytest, and later alembic) connects to the CI test database.
+    env:
+      DATABASE_URL: postgresql+psycopg://kc:kc@localhost:5432/kc_test
 
     # Throwaway Postgres + pgvector for integration tests. User/password match .env.example; the database
     # is kc_test (separate from the dev database kc). CI-only credentials, not real secrets.
@@ -74,5 +77,3 @@ jobs:
 
       - name: Pytest
         run: uv run pytest
-        env:
-          DATABASE_URL: postgresql+psycopg://kc:kc@localhost:5432/kc_test
