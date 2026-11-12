@@ -1,7 +1,7 @@
 """Checks that the integration-test switch in tests/db/conftest.py behaves as documented."""
 
 import pytest
-from conftest import INTEGRATION_ENV_VAR, integration_enabled
+from db_test_support import INTEGRATION_ENV_VAR, integration_enabled
 
 
 def test_integration_enabled_reads_env_var(monkeypatch: pytest.MonkeyPatch) -> None:

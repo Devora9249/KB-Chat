@@ -10,15 +10,8 @@ The marker is registered here (not in pyproject.toml) to stay inside this domain
 folders. The skip applies only to tests collected under tests/db.
 """
 
-import os
-
 import pytest
-
-INTEGRATION_ENV_VAR = "KC_INTEGRATION"
-
-
-def integration_enabled() -> bool:
-    return os.environ.get(INTEGRATION_ENV_VAR) == "1"
+from db_test_support import INTEGRATION_ENV_VAR, integration_enabled
 
 
 def pytest_configure(config: pytest.Config) -> None:
