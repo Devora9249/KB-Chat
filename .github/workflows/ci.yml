@@ -28,20 +28,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
-    # Throwaway Postgres + pgvector for integration tests. Credentials match DATABASE_URL in .env.example
-    # (postgresql+psycopg://kc:kc@localhost:5432/kc); they are CI-only, not real secrets.
+    # Throwaway Postgres + pgvector for integration tests. User/password match .env.example; the database
+    # is kc_test (separate from the dev database kc). CI-only credentials, not real secrets.
     services:
       postgres:
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: kc
           POSTGRES_PASSWORD: kc
-          POSTGRES_DB: kc
+          POSTGRES_DB: kc_test
         ports:
           - 5432:5432
         # Steps start only after the container reports healthy (pg_isready succeeds).
         options: >-
-          --health-cmd "pg_isready -U kc -d kc"
+          --health-cmd "pg_isready -U kc -d kc_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -68,5 +68,11 @@ jobs:
       - name: Mypy (strict, targets from pyproject.toml)
         run: uv run mypy
 
+      # TODO: once Raizy's DB work is merged (src/kc/db/alembic.ini exists), add a migrations step here:
+      #   - name: Alembic upgrade (test DB)
+      #     run: uv run alembic -c src/kc/db/alembic.ini upgrade head
+
       - name: Pytest
         run: uv run pytest
+        env:
+          DATABASE_URL: postgresql+psycopg://kc:kc@localhost:5432/kc_test
