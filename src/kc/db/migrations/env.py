@@ -1,4 +1,8 @@
-"""Alembic environment: async engine, URL from DATABASE_URL (never from alembic.ini)."""
+"""Alembic environment: async engine, URL from DATABASE_URL (never from alembic.ini).
+
+Callers (e.g. tests) may pass an explicit URL via `config.attributes["database_url"]`;
+it then takes precedence and `.env` is not read.
+"""
 
 import asyncio
 from logging.config import fileConfig
@@ -8,7 +12,7 @@ from sqlalchemy.engine import Connection
 
 from kc.db.engine import create_engine
 from kc.db.models import Base
-from kc.db.settings import load_db_settings
+from kc.db.settings import DbSettings, db_settings_from_url, load_db_settings
 
 config = context.config
 if config.config_file_name is not None and config.attributes.get("configure_logger", True):
@@ -17,10 +21,17 @@ if config.config_file_name is not None and config.attributes.get("configure_logg
 target_metadata = Base.metadata
 
 
+def _settings() -> DbSettings:
+    explicit_url = config.attributes.get("database_url")
+    if explicit_url:
+        return db_settings_from_url(str(explicit_url))
+    return load_db_settings()
+
+
 def run_migrations_offline() -> None:
     """Emit SQL to stdout / output buffer without connecting (`--sql`)."""
     context.configure(
-        url=load_db_settings().database_url.get_secret_value(),
+        url=_settings().database_url.get_secret_value(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -36,7 +47,7 @@ def _run_sync(connection: Connection) -> None:
 
 
 async def _run_async() -> None:
-    engine = create_engine(load_db_settings())
+    engine = create_engine(_settings())
     try:
         async with engine.connect() as connection:
             await connection.run_sync(_run_sync)

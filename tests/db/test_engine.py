@@ -1,7 +1,7 @@
 import asyncio
-import os
 
 import pytest
+from db_test_support import require_database_url
 from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,10 +38,11 @@ def test_session_factory_produces_async_sessions() -> None:
 
 @pytest.mark.integration
 def test_can_query_real_database() -> None:
-    """Needs KC_INTEGRATION=1 and DATABASE_URL pointing at a running Postgres."""
+    """Runs when DATABASE_URL is set (CI). Read-only, so no test-database guard needed."""
+    url = require_database_url()
 
     async def run() -> int:
-        engine = create_engine(_settings(os.environ["DATABASE_URL"]))
+        engine = create_engine(_settings(url))
         try:
             async with create_session_factory(engine)() as session:
                 return int((await session.execute(text("SELECT 1"))).scalar_one())

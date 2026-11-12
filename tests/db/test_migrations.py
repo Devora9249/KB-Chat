@@ -1,13 +1,13 @@
 """Migration checks that run without a database (Alembic offline / `--sql` mode)."""
 
 import io
-import os
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from db_test_support import require_database_url, require_test_database
 
 ALEMBIC_INI = Path(__file__).resolve().parents[2] / "src" / "kc" / "db" / "alembic.ini"
 FAKE_URL = "postgresql+psycopg://kc:kc@localhost:5432/kc"
@@ -62,11 +62,29 @@ def test_offline_sql_does_not_contain_password(monkeypatch: pytest.MonkeyPatch) 
     assert "s3cret" not in buffer.getvalue()
 
 
+def test_explicit_url_attribute_is_used_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With DATABASE_URL unset, env.py would fail validation; an explicit URL must be enough.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    buffer = io.StringIO()
+    config = _config(buffer)
+    config.attributes["database_url"] = FAKE_URL
+    command.upgrade(config, "head", sql=True)
+    assert "CREATE TABLE embedding_config" in buffer.getvalue()
+
+
 @pytest.mark.integration
 def test_upgrade_and_downgrade_on_real_database() -> None:
-    """Needs KC_INTEGRATION=1 and DATABASE_URL pointing at Postgres with pgvector available."""
-    assert os.environ.get("DATABASE_URL"), "set DATABASE_URL for integration tests"
+    """DESTRUCTIVE (drops all tables): runs only on a database whose name contains "test".
+
+    Uses DATABASE_URL from the environment explicitly (never `.env`) and always finishes
+    with `upgrade head`, so tests that run afterwards find the tables.
+    """
+    url = require_database_url()
+    require_test_database(url)
     config = _config()
+    config.attributes["database_url"] = url
     command.upgrade(config, "head")
-    command.downgrade(config, "base")
-    command.upgrade(config, "head")  # leave the DB migrated
+    try:
+        command.downgrade(config, "base")
+    finally:
+        command.upgrade(config, "head")  # leave the DB migrated, even if downgrade failed
