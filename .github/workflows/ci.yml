@@ -1,0 +1,79 @@
+# CI for kc-assistant: lint, format check, type check and tests on every PR to main and every push to any branch.
+# Owner: Platform & UI (Chani). Tool configuration lives in pyproject.toml — this file only invokes the tools.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ["**"]
+
+# Least privilege: the workflow only needs to read the repo.
+permissions:
+  contents: read
+
+# A new push to the same PR/branch cancels the run that is still in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Python code folders. Passed explicitly to ruff because recent ruff versions also
+  # format Python blocks inside Markdown files (e.g. CLAUDE.md), which is not code we ship.
+  PY_PATHS: src contracts tests eval
+
+jobs:
+  checks:
+    name: Lint, types & tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Job-level env: every step (pytest, and later alembic) connects to the CI test database.
+    env:
+      DATABASE_URL: postgresql+psycopg://kc:kc@localhost:5432/kc_test
+
+    # Throwaway Postgres + pgvector for integration tests. User/password match .env.example; the database
+    # is kc_test (separate from the dev database kc). CI-only credentials, not real secrets.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kc
+          POSTGRES_PASSWORD: kc
+          POSTGRES_DB: kc_test
+        ports:
+          - 5432:5432
+        # Steps start only after the container reports healthy (pg_isready succeeds).
+        options: >-
+          --health-cmd "pg_isready -U kc -d kc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies (from uv.lock)
+        run: uv sync --locked
+
+      - name: Ruff lint
+        run: uv run ruff check $PY_PATHS
+
+      - name: Ruff format check
+        run: uv run ruff format --check $PY_PATHS
+
+      - name: Mypy (strict, targets from pyproject.toml)
+        run: uv run mypy
+
+      # TODO: once Raizy's DB work is merged (src/kc/db/alembic.ini exists), add a migrations step here:
+      #   - name: Alembic upgrade (test DB)
+      #     run: uv run alembic -c src/kc/db/alembic.ini upgrade head
+
+      - name: Pytest
+        run: uv run pytest
