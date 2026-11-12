@@ -21,6 +21,22 @@ class Citation(BaseModel):
     chunk_id: str = Field(description="ID of the retrieved chunk the claim is based on")
 
 
+class AskRequest(BaseModel):
+    """What a client (UI, eval) sends to `/v1/ask`.
+
+    Open question for the team, product/version selection:
+    Users will often know their product and version (e.g. "SeQuence 9"), and passing
+    them lets search filter out same-named articles from other products (sensitive
+    point #1 in CLAUDE.md). We deliberately did NOT add `product` / `version` fields
+    yet, because they overlap with `Filters`, which is still to be agreed in Sprint 0.
+    Once `Filters` is defined, the plan is to add an optional `filters: Filters | None`
+    field here (optional, so this is a backward-compatible change). Until then, product
+    and version are detected from the question text by query understanding.
+    """
+
+    question: str = Field(min_length=1, max_length=2000, description="The user's question")
+
+
 class Answer(BaseModel):
     """What `/v1/ask` returns."""
 

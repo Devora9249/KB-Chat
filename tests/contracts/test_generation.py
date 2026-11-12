@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from contracts.generation import Answer, Citation
+from contracts.generation import Answer, AskRequest, Citation
 
 
 def make_citation(**overrides: object) -> Citation:
@@ -36,6 +36,21 @@ def test_citation_id_must_be_positive() -> None:
 def test_citation_json_round_trip() -> None:
     citation = make_citation()
     assert Citation.model_validate_json(citation.model_dump_json()) == citation
+
+
+def test_ask_request_valid() -> None:
+    request = AskRequest(question="How do I configure SAML in SeQuence 9?")
+    assert request.question.startswith("How")
+
+
+def test_ask_request_empty_question_fails() -> None:
+    with pytest.raises(ValidationError):
+        AskRequest(question="")
+
+
+def test_ask_request_too_long_question_fails() -> None:
+    with pytest.raises(ValidationError):
+        AskRequest(question="x" * 2001)
 
 
 def test_answer_answered_with_citation() -> None:
