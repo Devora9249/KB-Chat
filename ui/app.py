@@ -24,7 +24,11 @@ def render_answer(answer: Answer) -> str:
 @cl.on_chat_start
 async def on_chat_start() -> None:
     await cl.Message(
-        content="Hi! Ask me a question about Cora products (answers are FAKE for now)."
+        content=(
+            "### Cora Knowledge Center Assistant\n"
+            "Ask a question about Cora Orchestration, Case Manager, SeQuence or OpsManager. "
+            "(Answers are FAKE for now.)"
+        )
     ).send()
 
 
