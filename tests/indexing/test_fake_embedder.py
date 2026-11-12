@@ -1,63 +1,114 @@
+"""Contract tests for FakeEmbedder (draft storage contract D1-D5)."""
+
 import asyncio
 import math
+from typing import Any
 
 import pytest
 
+from kc.indexing._provisional_contracts import InputType
 from kc.indexing.fake_embedder import FakeEmbedder
+from kc.indexing.vector_math import cosine_similarity, norm
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    return sum(x * y for x, y in zip(a, b, strict=True))  # vectors are already normalized
+def _embed(embedder: FakeEmbedder, texts: list[str], input_type: InputType) -> list[list[float]]:
+    return asyncio.run(embedder.embed(texts, input_type=input_type))
 
 
-def _embed(embedder: FakeEmbedder, texts: list[str]) -> list[list[float]]:
-    return asyncio.run(embedder.embed(texts))
+# --- D1: model identity -------------------------------------------------------------
 
 
-def test_returns_one_vector_per_text_with_configured_dim() -> None:
-    vectors = _embed(FakeEmbedder(dim=64), ["a", "b c", "d"])
-    assert len(vectors) == 3
-    assert all(len(v) == 64 for v in vectors)
+def test_exposes_model_name_and_dimension() -> None:
+    embedder = FakeEmbedder()
+    assert embedder.model_name == "fake-embedder-v1"
+    assert embedder.dimension == 256
+    custom = FakeEmbedder(dimension=64, model_name="fake-x")
+    assert (custom.model_name, custom.dimension) == ("fake-x", 64)
 
 
-def test_empty_input_returns_empty_list() -> None:
-    assert _embed(FakeEmbedder(), []) == []
+@pytest.mark.parametrize("input_type", ["query", "document"])
+def test_every_vector_has_declared_dimension(input_type: InputType) -> None:
+    embedder = FakeEmbedder(dimension=64)
+    vectors = _embed(embedder, ["a", "b c", "", "!!!"], input_type)
+    assert all(len(v) == embedder.dimension for v in vectors)
 
 
-def test_is_deterministic() -> None:
+# --- one vector per text, same order, embed([]) ---------------------------------------
+
+
+def test_one_vector_per_text_in_input_order() -> None:
+    embedder = FakeEmbedder()
+    texts = ["first text", "second text", "third"]
+    together = _embed(embedder, texts, "document")
+    one_by_one = [_embed(embedder, [t], "document")[0] for t in texts]
+    assert together == one_by_one
+
+
+@pytest.mark.parametrize("input_type", ["query", "document"])
+def test_empty_input_returns_empty_list(input_type: InputType) -> None:
+    assert _embed(FakeEmbedder(), [], input_type) == []
+
+
+# --- D4: unit length ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", ["Configure SAML authentication", "x", "", "   !!! "])
+@pytest.mark.parametrize("input_type", ["query", "document"])
+def test_vectors_are_unit_length_even_for_empty_text(text: str, input_type: InputType) -> None:
+    (vector,) = _embed(FakeEmbedder(), [text], input_type)
+    assert math.isclose(norm(vector), 1.0)
+
+
+# --- determinism --------------------------------------------------------------------
+
+
+def test_is_deterministic_across_instances() -> None:
     text = "How do I configure SAML in SeQuence 9?"
-    first = _embed(FakeEmbedder(), [text])
-    second = _embed(FakeEmbedder(), [text])
-    assert first == second
-
-
-def test_vectors_are_unit_length() -> None:
-    (vector,) = _embed(FakeEmbedder(), ["Configure SAML authentication"])
-    assert math.isclose(math.sqrt(sum(x * x for x in vector)), 1.0)
-
-
-def test_text_without_tokens_gives_zero_vector() -> None:
-    (vector,) = _embed(FakeEmbedder(dim=16), ["   !!! "])
-    assert vector == [0.0] * 16
-
-
-def test_similar_texts_are_closer_than_unrelated_texts() -> None:
-    query, related, unrelated = _embed(
-        FakeEmbedder(),
-        [
-            "configure SAML authentication",
-            "how to configure SAML authentication in SeQuence",
-            "release notes for case manager version 11",
-        ],
-    )
-    assert _cosine(query, related) > _cosine(query, unrelated)
+    assert _embed(FakeEmbedder(), [text], "query") == _embed(FakeEmbedder(), [text], "query")
 
 
 def test_case_insensitive() -> None:
-    lower, upper = _embed(FakeEmbedder(), ["saml config", "SAML Config"])
+    lower, upper = _embed(FakeEmbedder(), ["saml config", "SAML Config"], "document")
     assert lower == upper
 
 
-def test_invalid_dim_raises() -> None:
+# --- D2: query vs document ------------------------------------------------------------
+
+
+def test_query_and_document_vectors_differ_but_stay_similar() -> None:
+    embedder = FakeEmbedder()
+    text = "configure SAML authentication"
+    (as_query,) = _embed(embedder, [text], "query")
+    (as_document,) = _embed(embedder, [text], "document")
+    assert as_query != as_document
+    assert cosine_similarity(as_query, as_document) > 0.85
+
+
+def test_query_finds_related_document_over_unrelated() -> None:
+    embedder = FakeEmbedder()
+    (query,) = _embed(embedder, ["configure SAML authentication"], "query")
+    related, unrelated = _embed(
+        embedder,
+        [
+            "how to configure SAML authentication in SeQuence",
+            "release notes for case manager version 11",
+        ],
+        "document",
+    )
+    assert cosine_similarity(query, related) > cosine_similarity(query, unrelated)
+
+
+def test_invalid_input_type_raises() -> None:
+    bad: Any = "passage"  # bypass mypy on purpose: simulates an untyped caller
+    with pytest.raises(ValueError, match="input_type"):
+        _embed(FakeEmbedder(), ["x"], bad)
+
+
+# --- constructor validation -----------------------------------------------------------
+
+
+def test_invalid_constructor_arguments_raise() -> None:
     with pytest.raises(ValueError):
-        FakeEmbedder(dim=0)
+        FakeEmbedder(dimension=0)
+    with pytest.raises(ValueError):
+        FakeEmbedder(model_name="")
