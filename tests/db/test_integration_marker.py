@@ -7,6 +7,7 @@ from db_test_support import (
     database_url,
     integration_enabled,
     is_test_database,
+    migrate_if_test_database,
     require_test_database,
 )
 
@@ -53,6 +54,23 @@ def test_require_test_database_skips_for_non_test_database() -> None:
 
 def test_require_test_database_allows_test_database() -> None:
     require_test_database("postgresql+psycopg://kc:kc@localhost:5432/kc_test")  # no skip
+
+
+@pytest.mark.parametrize(
+    ("url", "should_migrate"),
+    [
+        ("postgresql+psycopg://kc:kc@localhost:5432/kc_test", True),
+        ("postgresql+psycopg://kc:kc@localhost:5432/kc", False),  # shared DB: never migrate
+        ("postgresql+psycopg://test:test@test-host:5432/kc", False),
+    ],
+)
+def test_migrate_if_test_database_only_migrates_test_databases(
+    url: str, should_migrate: bool
+) -> None:
+    calls: list[str] = []
+    ran = migrate_if_test_database(url, upgrade=calls.append)
+    assert ran is should_migrate
+    assert calls == ([url] if should_migrate else [])
 
 
 @pytest.mark.integration

@@ -73,8 +73,12 @@ def test_alembic_config_sets_url_only_when_given() -> None:
 
 @pytest.mark.integration
 def test_upgrade_head_is_idempotent() -> None:
-    """The session fixture already migrated the DB; upgrading again must be a no-op."""
+    """The session fixture already migrated the DB; upgrading again must be a no-op.
+
+    Changes the schema if it is behind, so (like the fixture) only on a test database.
+    """
     url = require_database_url()
+    require_test_database(url)
     upgrade_to_head(url)
     upgrade_to_head(url)
 

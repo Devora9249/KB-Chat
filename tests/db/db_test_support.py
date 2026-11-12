@@ -3,7 +3,8 @@ so `from conftest import ...` could pick up the wrong one depending on collectio
 
 Integration tests run automatically when DATABASE_URL is set in the environment (as in CI)
 and are skipped otherwise. pytest does NOT read `.env`, so a local `.env` never turns them on.
-Before the first integration test, the database is migrated once (`alembic upgrade head`).
+Before the first integration test, a TEST database (name contains "test") is migrated once
+(`alembic upgrade head`); any other database is left untouched.
 
 Destructive tests (dropping tables, deleting rows) additionally require the database NAME
 to contain "test", so they can never wipe a shared development database by accident.
@@ -11,6 +12,7 @@ to contain "test", so they can never wipe a shared development database by accid
 
 import io
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -72,3 +74,15 @@ def alembic_config(
 def upgrade_to_head(url: str) -> None:
     """Idempotent: Alembic applies only migrations missing from alembic_version."""
     command.upgrade(alembic_config(database_url=url), "head")
+
+
+def migrate_if_test_database(url: str, upgrade: Callable[[str], None] = upgrade_to_head) -> bool:
+    """Run `upgrade(url)` only if the database NAME contains "test"; return whether it ran.
+
+    A shared/non-test database is never migrated by tests (an unmerged migration on a
+    branch must not change everyone's schema). `upgrade` is injectable for unit tests.
+    """
+    if not is_test_database(url):
+        return False
+    upgrade(url)
+    return True
