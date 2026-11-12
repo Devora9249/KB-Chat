@@ -1,4 +1,4 @@
-# CI for kc-assistant: lint, format check, type check and tests on every PR to main and every push to main.
+# CI for kc-assistant: lint, format check, type check and tests on every PR to main and every push to any branch.
 # Owner: Platform & UI (Chani). Tool configuration lives in pyproject.toml — this file only invokes the tools.
 name: CI
 
@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: ["**"]
 
 # Least privilege: the workflow only needs to read the repo.
 permissions:
@@ -27,6 +27,24 @@ jobs:
     name: Lint, types & tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    # Throwaway Postgres + pgvector for integration tests. Credentials match DATABASE_URL in .env.example
+    # (postgresql+psycopg://kc:kc@localhost:5432/kc); they are CI-only, not real secrets.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kc
+          POSTGRES_PASSWORD: kc
+          POSTGRES_DB: kc
+        ports:
+          - 5432:5432
+        # Steps start only after the container reports healthy (pg_isready succeeds).
+        options: >-
+          --health-cmd "pg_isready -U kc -d kc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Check out code
