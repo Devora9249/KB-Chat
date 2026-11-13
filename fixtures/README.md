@@ -11,12 +11,30 @@ so every domain can build and test without waiting for the crawler.
 
 ## How to use
 
-```python
-from kc.ingestion.samples import load_sample_chunks, load_sample_documents
+Depend on the `IngestionSource` Protocol from `contracts`, and receive it as a parameter:
 
-docs = load_sample_documents()   # list[Document]
-chunks = load_sample_chunks()    # list[Chunk]
+```python
+from contracts import IngestionSource
+
+
+async def index_all(source: IngestionSource) -> None:
+    async for item in source.iter_documents():
+        ...  # item.document: Document, item.chunks: list[Chunk]
 ```
+
+For now, pass the sample implementation:
+
+```python
+from kc.ingestion.samples import SampleIngestionSource
+
+await index_all(SampleIngestionSource())
+```
+
+On integration day only that line changes (to the real crawler-based source).
+Keep using `SampleIngestionSource` in unit tests: it is fast and needs no network.
+
+Every item is checked by the contract: it has at least one chunk, and every chunk
+belongs to its document and carries the same `product`, `versions` and `doc_type`.
 
 ## Hard cases included
 

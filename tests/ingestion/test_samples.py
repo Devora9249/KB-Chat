@@ -1,45 +1,57 @@
-"""Tests for the sample fixtures teammates build against."""
+"""Tests for SampleIngestionSource and the fixture files behind it.
 
-from fixtures.build_samples_v0 import build
-from kc.ingestion.samples import load_sample_chunks, load_sample_documents
+The tests go through the public interface (`iter_documents`), the same way
+teammates use it.
+"""
+
+import asyncio
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from contracts import Chunk, Document, IngestedDocument, IngestionSource
+from fixtures.build_samples_v0 import build, write_jsonl
+from kc.ingestion.samples import SampleIngestionSource
 
 
-def test_files_load_and_match_contract() -> None:
-    # model_validate_json inside the loaders raises if any line breaks the contract
-    assert len(load_sample_documents()) == 10
-    assert len(load_sample_chunks()) > 10
+def collect(source: IngestionSource) -> list[IngestedDocument]:
+    async def run() -> list[IngestedDocument]:
+        return [item async for item in source.iter_documents()]
+
+    return asyncio.run(run())
 
 
-def test_files_are_up_to_date_with_builder() -> None:
+@pytest.fixture(scope="module")
+def items() -> list[IngestedDocument]:
+    return collect(SampleIngestionSource())
+
+
+def all_docs(items: list[IngestedDocument]) -> list[Document]:
+    return [i.document for i in items]
+
+
+def all_chunks(items: list[IngestedDocument]) -> list[Chunk]:
+    return [c for i in items for c in i.chunks]
+
+
+# --- The fixture files ---------------------------------------------------------
+
+
+def test_files_are_up_to_date_with_builder(items: list[IngestedDocument]) -> None:
     # If this fails: run `uv run python fixtures/build_samples_v0.py` and commit the files.
     docs, chunks = build()
-    assert load_sample_documents() == docs
-    assert load_sample_chunks() == chunks
+    assert all_docs(items) == docs
+    assert sorted(all_chunks(items), key=lambda c: c.id) == sorted(chunks, key=lambda c: c.id)
 
 
-def test_chunk_ids_are_unique() -> None:
-    ids = [c.id for c in load_sample_chunks()]
+def test_chunk_ids_are_unique_across_all_documents(items: list[IngestedDocument]) -> None:
+    ids = [c.id for c in all_chunks(items)]
     assert len(ids) == len(set(ids))
 
 
-def test_every_chunk_belongs_to_a_document_with_same_labels() -> None:
-    docs = {d.url: d for d in load_sample_documents()}
-    for chunk in load_sample_chunks():
-        doc = docs[chunk.document_url]
-        assert (chunk.product, chunk.versions, chunk.doc_type) == (
-            doc.product,
-            doc.versions,
-            doc.doc_type,
-        )
-
-
-def test_every_document_has_chunks() -> None:
-    chunk_urls = {c.document_url for c in load_sample_chunks()}
-    assert {d.url for d in load_sample_documents()} == chunk_urls
-
-
-def test_hard_cases_are_covered() -> None:
-    docs = load_sample_documents()
+def test_hard_cases_are_covered(items: list[IngestedDocument]) -> None:
+    docs = all_docs(items)
     # same title in two products
     saml = {d.product for d in docs if d.title == "Configure SAML Authentication"}
     assert saml == {"sequence", "orchestration"}
@@ -49,4 +61,29 @@ def test_hard_cases_are_covered() -> None:
     assert any(len(d.versions) > 1 for d in docs)
     assert any(d.product == "general" and d.versions == [] for d in docs)
     # an exact technical name, for text search
-    assert any("Set-CoraSeQuenceSiteAuthentication" in c.text for c in load_sample_chunks())
+    assert any("Set-CoraSeQuenceSiteAuthentication" in c.text for c in all_chunks(items))
+
+
+# --- SampleIngestionSource -----------------------------------------------------
+
+
+def test_yields_every_document_once(items: list[IngestedDocument]) -> None:
+    urls = [d.url for d in all_docs(items)]
+    assert len(urls) == 10
+    assert len(set(urls)) == 10
+
+
+def test_custom_dir_with_orphan_chunk_fails(tmp_path: Path) -> None:
+    docs, chunks = build()
+    write_jsonl(tmp_path / "sample_docs.jsonl", docs[:1])  # drop all docs but one
+    write_jsonl(tmp_path / "sample_chunks.jsonl", chunks)
+    with pytest.raises(ValueError, match="chunks without a document"):
+        collect(SampleIngestionSource(tmp_path))
+
+
+def test_custom_dir_with_document_without_chunks_fails(tmp_path: Path) -> None:
+    docs, _ = build()
+    write_jsonl(tmp_path / "sample_docs.jsonl", docs[:1])
+    write_jsonl(tmp_path / "sample_chunks.jsonl", [])
+    with pytest.raises(ValidationError):
+        collect(SampleIngestionSource(tmp_path))
