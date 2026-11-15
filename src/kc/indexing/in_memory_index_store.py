@@ -14,6 +14,9 @@ Inputs are copied, so later changes by the caller do not leak into the store.
 
 Embedding-model guard: the real PgIndexStore compares model_name/dimension with the
 embedding_config table; here there is no table, so model_name is only kept.
+
+Errors: raises ValueError for invalid input, like every IndexStore. It never raises
+IndexStoreError, because it has no infrastructure (no connection, no database).
 """
 
 import re

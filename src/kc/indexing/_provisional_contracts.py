@@ -31,6 +31,7 @@ __all__ = [
     "EmbeddingError",
     "Filters",
     "IndexStore",
+    "IndexStoreError",
     "InputType",
     "Product",
     "SearchResult",
@@ -73,7 +74,15 @@ InputType = Literal["query", "document"]
 
 
 class EmbeddingError(RuntimeError):
-    """The embedding provider failed after retries (network, quota, invalid input)."""
+    """The embedding provider failed after the embedder's internal retries were exhausted."""
+
+
+class IndexStoreError(RuntimeError):
+    """Infrastructure failure inside an IndexStore (connection, timeout, database error).
+
+    Implementations wrap the original error with `raise IndexStoreError(...) from e`, so it
+    stays available in `__cause__`.
+    """
 
 
 @runtime_checkable
@@ -83,6 +92,11 @@ class Embedder(Protocol):
     Concurrency: one instance must be safe to use from several concurrent async calls.
     An implementation may run the calls one after another (e.g. with a Lock), but must
     never mix up their results.
+
+    Errors:
+    - EmbeddingError: raised only after the embedder's internal retries have failed.
+    - ValueError: invalid input (a bug in the caller); NOT wrapped.
+    - asyncio.CancelledError: never wrapped (cancellation must propagate).
     """
 
     @property
@@ -106,6 +120,15 @@ class IndexStore(Protocol):
     Future PgIndexStore: receives an async_sessionmaker in its constructor (the Engine
     is created and disposed by the application), opens a short session per call, and
     runs upsert_document in a single transaction.
+
+    Errors:
+    - ValueError: invalid input (a bug in the caller, e.g. k <= 0, wrong vector
+      dimension, chunk of another document); NOT wrapped.
+    - IndexStoreError: infrastructure failure (connection, timeout, database error).
+      Implementations wrap it with `raise IndexStoreError(...) from e`, so the original
+      error is kept in `__cause__`.
+    - No retries inside an IndexStore: whether to retry is the caller's decision.
+    - asyncio.CancelledError: never wrapped (cancellation must propagate).
     """
 
     async def upsert_document(
