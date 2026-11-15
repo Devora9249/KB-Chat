@@ -1,6 +1,4 @@
-"""PostgreSQL + pgvector implementation of the index - WRITE side (IndexWriter).
-
-The search side (vector_search, text_search) comes in the next step.
+"""PostgreSQL + pgvector implementation of the index: IndexStore = SearchIndex + IndexWriter.
 
 Sessions: receives an async_sessionmaker (the Engine and its pool are created and disposed
 by the application) and opens a SHORT session per call, so one instance is safe for
@@ -14,6 +12,26 @@ upsert_document runs in ONE transaction:
   5. COMMIT - only now other sessions see the change; any failure rolls everything back,
      so the previous version stays. Concurrent searches see the old or the new version,
      never a mix (Postgres MVCC).
+
+vector_search (cosine; score = 1 - cosine distance):
+- inner query: `ORDER BY embedding <=> :q LIMIT k + TIE_MARGIN` with the filters in WHERE,
+  answered by the HNSW index; outer query: JOIN documents (title), ORDER BY distance,
+  chunk_id, LIMIT k. The margin lets equal distances at the cut-off be ordered by chunk_id.
+- hnsw.iterative_scan = strict_order: if the filters reject the first ef_search candidates,
+  pgvector keeps scanning the index until it has enough matching rows (up to
+  hnsw.max_scan_tuples), so a narrow filter still returns k results when they exist.
+  strict_order (not relaxed_order) keeps results exactly ordered by distance, which the
+  contract requires.
+- hnsw.ef_search = max(40, k + TIE_MARGIN), capped at 1000; both settings are
+  transaction-local (set_config(..., is_local => true) == SET LOCAL), so other requests are
+  not affected.
+
+text_search: tsv @@ websearch_to_tsquery('simple', :q), ORDER BY ts_rank DESC, chunk_id.
+A query without any word returns [] without touching the database.
+
+Filters (contracts.retrieval.Filters): OR within a field, AND across fields,
+exclude_doc_types removes, and `versions` never matches version IS NULL (SQL `IN` is never
+true for NULL).
 
 Embedding-model guard: call `await store.verify_embedding_config(model_name, dimension)`
 once at startup. It reuses kc.db.embedding_config (records the model on first use, raises
@@ -32,21 +50,117 @@ Errors:
 - No retries here: the caller decides. asyncio.CancelledError is never caught.
 """
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import psycopg
-from sqlalchemy import delete, insert, select
+from sqlalchemy import ColumnElement, Select, delete, insert, literal, select
 from sqlalchemy import exc as sa_exc
+from sqlalchemy.dialects.postgresql import REGCONFIG
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import func
 
+from contracts.retrieval import Filters, SearchResult
 from contracts.storage import IndexStoreError
 from kc.db.embedding_config import EmbeddingConfigMismatchError, ensure_embedding_config
 from kc.db.models import EMBEDDING_DIMENSION, ChunkRow, DocumentRow
 from kc.indexing._provisional_contracts import Chunk, Document
 from kc.indexing.upsert_validation import validate_upsert
+
+# Extra rows fetched by the inner (index) query, so equal distances / ranks at the k-th
+# position are still ordered by chunk_id in the outer query.
+TIE_MARGIN = 10
+DEFAULT_EF_SEARCH = 40  # pgvector's default
+MAX_EF_SEARCH = 1000  # pgvector's upper limit
+_WORD_RE = re.compile(r"\w", re.UNICODE)
+
+
+def ef_search_for(k: int) -> int:
+    """HNSW candidate list size for a top-k query (transaction-local setting)."""
+    return min(MAX_EF_SEARCH, max(DEFAULT_EF_SEARCH, k + TIE_MARGIN))
+
+
+def _check_k(k: int) -> None:
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
+
+
+def _filter_clauses(filters: Filters | None) -> list[ColumnElement[bool]]:
+    """Filters semantics: OR within a field (IN), AND across fields (list of clauses)."""
+    if filters is None:
+        return []
+    clauses: list[ColumnElement[bool]] = []
+    if filters.products is not None:
+        clauses.append(ChunkRow.product.in_(filters.products))
+    if filters.versions is not None:
+        clauses.append(ChunkRow.version.in_(filters.versions))  # NULL never matches IN
+    if filters.doc_types is not None:
+        clauses.append(ChunkRow.doc_type.in_(filters.doc_types))
+    if filters.exclude_doc_types is not None:
+        clauses.append(ChunkRow.doc_type.not_in(filters.exclude_doc_types))
+    return clauses
+
+
+_RESULT_COLUMNS = (
+    ChunkRow.id,
+    ChunkRow.document_url,
+    ChunkRow.text,
+    ChunkRow.heading_path,
+    ChunkRow.product,
+    ChunkRow.version,
+    ChunkRow.doc_type,
+)
+
+
+def build_vector_search_statement(
+    vector: list[float], filters: Filters | None, k: int
+) -> Select[Any]:
+    """Inner query uses the HNSW index (ORDER BY distance LIMIT); outer adds title and the
+    chunk_id tie-break. Public so tests can EXPLAIN exactly what vector_search runs."""
+    distance = ChunkRow.embedding.cosine_distance(vector).label("distance")
+    inner = (
+        select(*_RESULT_COLUMNS, distance)
+        .where(*_filter_clauses(filters))
+        .order_by(distance)
+        .limit(k + TIE_MARGIN)
+        .subquery("nearest")
+    )
+    return (
+        select(inner, DocumentRow.title, (1 - inner.c.distance).label("score"))
+        .join(DocumentRow, DocumentRow.url == inner.c.document_url)
+        .order_by(inner.c.distance, inner.c.id)
+        .limit(k)
+    )
+
+
+def build_text_search_statement(query: str, filters: Filters | None, k: int) -> Select[Any]:
+    tsquery = func.websearch_to_tsquery(literal("simple", REGCONFIG), query)
+    rank = func.ts_rank(ChunkRow.tsv, tsquery).label("score")
+    return (
+        select(*_RESULT_COLUMNS, DocumentRow.title, rank)
+        .join(DocumentRow, DocumentRow.url == ChunkRow.document_url)
+        .where(ChunkRow.tsv.op("@@")(tsquery), *_filter_clauses(filters))
+        .order_by(rank.desc(), ChunkRow.id)
+        .limit(k)
+    )
+
+
+def _to_result(row: Any) -> SearchResult:
+    return SearchResult(
+        chunk_id=row.id,
+        url=row.document_url,
+        title=row.title,
+        text=row.text,
+        score=float(row.score),
+        product=row.product,
+        version=row.version,
+        doc_type=row.doc_type,
+        heading_path=list(row.heading_path),
+    )
+
 
 # Infrastructure failures that are wrapped in IndexStoreError. Nothing broader on purpose.
 INFRASTRUCTURE_ERRORS: tuple[type[BaseException], ...] = (
@@ -76,7 +190,7 @@ async def _infrastructure_errors(operation: str) -> AsyncIterator[None]:
 
 
 class PgIndexStore:
-    """IndexWriter backed by PostgreSQL + pgvector (search side: next step)."""
+    """IndexStore (SearchIndex + IndexWriter) backed by PostgreSQL + pgvector."""
 
     def __init__(
         self,
@@ -182,3 +296,38 @@ class PgIndexStore:
             async with self._session_factory() as session:
                 rows = await session.execute(select(DocumentRow.url, DocumentRow.content_hash))
                 return {url: content_hash for url, content_hash in rows.all()}
+
+    # --- SearchIndex ------------------------------------------------------------------------
+
+    async def vector_search(
+        self, vector: list[float], filters: Filters | None = None, *, k: int = 10
+    ) -> list[SearchResult]:
+        _check_k(k)
+        if len(vector) != self._dimension:
+            raise ValueError(
+                f"query vector has dimension {len(vector)}, index dimension is {self._dimension}"
+            )
+        statement = build_vector_search_statement(list(vector), filters, k)
+        async with _infrastructure_errors("vector_search"):
+            async with self._session_factory() as session, session.begin():
+                # Transaction-local (== SET LOCAL): never leaks into other requests.
+                await session.execute(
+                    select(
+                        func.set_config("hnsw.iterative_scan", "strict_order", True),
+                        func.set_config("hnsw.ef_search", str(ef_search_for(k)), True),
+                    )
+                )
+                rows = await session.execute(statement)
+                return [_to_result(row) for row in rows.all()]
+
+    async def text_search(
+        self, query: str, filters: Filters | None = None, *, k: int = 10
+    ) -> list[SearchResult]:
+        _check_k(k)
+        if not _WORD_RE.search(query):
+            return []  # nothing to search for; do not touch the database
+        statement = build_text_search_statement(query, filters, k)
+        async with _infrastructure_errors("text_search"):
+            async with self._session_factory() as session:
+                rows = await session.execute(statement)
+                return [_to_result(row) for row in rows.all()]

@@ -22,5 +22,7 @@ if TYPE_CHECKING:
     _as_index_store: IndexStore = _store
     _as_embedder: Embedder = FakeEmbedder()
 
-    # Write side only for now; becomes `IndexStore` once vector_search/text_search exist.
-    _pg_as_index_writer: IndexWriter = PgIndexStore(async_sessionmaker[AsyncSession]())
+    _pg = PgIndexStore(async_sessionmaker[AsyncSession]())
+    _pg_as_search_index: SearchIndex = _pg
+    _pg_as_index_writer: IndexWriter = _pg
+    _pg_as_index_store: IndexStore = _pg

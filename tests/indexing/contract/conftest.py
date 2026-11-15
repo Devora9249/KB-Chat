@@ -3,7 +3,8 @@
 - `make_search_index`: a SearchIndex already loaded with given documents. Search tests use
   ONLY vector_search / text_search on it (contracts.storage.SearchIndex).
 - `store` / `make_store`: a fresh, empty full IndexStore (search + write), e.g. for the
-  concurrency tests. Registry: IMPLEMENTATIONS.
+  concurrency tests. Registry: IMPLEMENTATIONS. "pg" runs the dimension-3 tests through a
+  zero-padding adapter (cosine similarity is unchanged by zero-padding).
 - `writer`: a fresh, empty IndexWriter plus an observer that reads back what it stored
   WITHOUT the search side. Write tests use it. Registry: WRITER_IMPLEMENTATIONS.
 - `embedder`: one per entry in EMBEDDER_IMPLEMENTATIONS (contracts.storage.Embedder).
@@ -31,11 +32,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from contracts.retrieval import Filters, SearchResult
 from contracts.storage import Embedder, SearchIndex
 from kc.db.engine import create_session_factory
 from kc.db.models import EMBEDDING_DIMENSION
 from kc.db.pg_index_store import PgIndexStore
-from kc.indexing._provisional_contracts import IndexStore
+from kc.indexing._provisional_contracts import Chunk, Document, IndexStore
 from kc.indexing.fake_embedder import FakeEmbedder
 from kc.indexing.in_memory_index_store import InMemoryIndexStore
 from tests.db.db_test_support import (
@@ -60,17 +62,23 @@ def _in_memory(dimension: int) -> IndexStore:
     return InMemoryIndexStore(dimension=dimension, model_name="contract-tests")
 
 
-# TODO(PgIndexStore search side, step 4): add "pg" here too.
-IMPLEMENTATIONS: dict[str, StoreFactory] = {
-    "in_memory": _in_memory,
+# Each entry turns the pytest request into a StoreFactory (dimension -> fresh, empty store).
+IMPLEMENTATIONS: dict[str, Callable[[pytest.FixtureRequest], StoreFactory]] = {
+    "in_memory": lambda request: _in_memory,
+    "pg": lambda request: request.getfixturevalue("pg_store_factory"),
 }
+INTEGRATION_STORES = {"pg"}  # need Postgres: run only with DATABASE_URL (CI)
 
 
-@pytest.fixture(params=sorted(IMPLEMENTATIONS))
+@pytest.fixture(
+    params=[
+        pytest.param(name, marks=pytest.mark.integration) if name in INTEGRATION_STORES else name
+        for name in sorted(IMPLEMENTATIONS)
+    ]
+)
 def make_store(request: pytest.FixtureRequest) -> StoreFactory:
     """Factory for a fresh, empty store of the current implementation (any dimension)."""
-    factory: StoreFactory = IMPLEMENTATIONS[request.param]
-    return factory
+    return IMPLEMENTATIONS[request.param](request)
 
 
 @pytest.fixture
@@ -163,8 +171,8 @@ async def _stored_chunks(engine: AsyncEngine) -> list[StoredChunk]:
 
 
 @pytest.fixture
-def pg_writer(pg_test_database_url: str) -> Iterator[WriterUnderTest]:
-    """PgIndexStore on emptied tables.
+def pg_engine(pg_test_database_url: str) -> Iterator[AsyncEngine]:
+    """Engine on emptied tables (emptied again afterwards).
 
     NullPool: the contract tests call asyncio.run() per operation, i.e. a new event loop
     each time, and pooled async connections cannot move between event loops. Production
@@ -172,16 +180,76 @@ def pg_writer(pg_test_database_url: str) -> Iterator[WriterUnderTest]:
     """
     engine = create_async_engine(pg_test_database_url, poolclass=NullPool)
     run(_truncate(engine))
-    store = PgIndexStore(create_session_factory(engine))
     try:
-        yield WriterUnderTest(
-            writer=store,
-            dimension=EMBEDDING_DIMENSION,
-            stored=lambda: run(_stored_chunks(engine)),
-        )
+        yield engine
     finally:
         run(_truncate(engine))
         run(engine.dispose())
+
+
+@pytest.fixture
+def pg_writer(pg_engine: AsyncEngine) -> WriterUnderTest:
+    """PgIndexStore as a writer, observed directly through SQL (no search involved)."""
+    return WriterUnderTest(
+        writer=PgIndexStore(create_session_factory(pg_engine)),
+        dimension=EMBEDDING_DIMENSION,
+        stored=lambda: run(_stored_chunks(pg_engine)),
+    )
+
+
+class ZeroPaddedIndexStore:
+    """Test adapter: lets the dimension-3 contract tests run on the vector(1024) column.
+
+    Vectors of exactly `dimension` values are padded with zeros up to the column's
+    dimension. Zero-padding does not change cosine similarity, so every contract
+    assertion keeps its meaning. Vectors of any other length are passed through unchanged,
+    so the "wrong dimension -> ValueError" tests still hit PgIndexStore's own check.
+    """
+
+    def __init__(self, inner: PgIndexStore, dimension: int) -> None:
+        self._inner = inner
+        self._dimension = dimension
+
+    def _pad(self, vector: list[float]) -> list[float]:
+        if len(vector) != self._dimension:
+            return vector
+        return list(vector) + [0.0] * (EMBEDDING_DIMENSION - self._dimension)
+
+    async def upsert_document(
+        self, document: Document, chunks: list[Chunk], vectors: list[list[float]]
+    ) -> None:
+        await self._inner.upsert_document(document, chunks, [self._pad(v) for v in vectors])
+
+    async def delete_document(self, url: str) -> None:
+        await self._inner.delete_document(url)
+
+    async def get_document_hashes(self) -> dict[str, str]:
+        return await self._inner.get_document_hashes()
+
+    async def vector_search(
+        self, vector: list[float], filters: Filters | None = None, *, k: int = 10
+    ) -> list[SearchResult]:
+        return await self._inner.vector_search(self._pad(vector), filters, k=k)
+
+    async def text_search(
+        self, query: str, filters: Filters | None = None, *, k: int = 10
+    ) -> list[SearchResult]:
+        return await self._inner.text_search(query, filters, k=k)
+
+
+@pytest.fixture
+def pg_store_factory(pg_engine: AsyncEngine) -> StoreFactory:
+    """dimension -> PgIndexStore on the emptied tables (zero-padded to vector(1024))."""
+
+    def factory(dimension: int) -> IndexStore:
+        if dimension > EMBEDDING_DIMENSION:
+            raise ValueError(f"cannot pad dimension {dimension} into vector(1024)")
+        store = PgIndexStore(create_session_factory(pg_engine))
+        if dimension == EMBEDDING_DIMENSION:
+            return store
+        return ZeroPaddedIndexStore(store, dimension)
+
+    return factory
 
 
 # --- Embedder -----------------------------------------------------------------------------------

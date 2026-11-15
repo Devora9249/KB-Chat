@@ -1,8 +1,10 @@
-"""PgIndexStore-specific tests (the write contract itself is in tests/indexing/contract/).
+"""PgIndexStore-specific tests (the contract itself is in tests/indexing/contract/).
 
-- Fast tests (no database): error wrapping with a deliberately failing session, and that
-  invalid input / a dimension mismatch is rejected BEFORE any database access.
-- Integration test (CI): verify_embedding_config against the real embedding_config table.
+- Fast tests (no database): error wrapping with a deliberately failing session; invalid
+  input, a dimension mismatch or a word-less text query never touch the database.
+- Integration tests (CI): verify_embedding_config against the real embedding_config
+  table; the vector query uses the HNSW index; a narrow filter still returns k results
+  thanks to hnsw.iterative_scan (and loses results without it).
 """
 
 import asyncio
@@ -12,16 +14,17 @@ from typing import Any
 import psycopg
 import pytest
 from db_test_support import require_database_url, require_test_database
-from sqlalchemy import delete
+from sqlalchemy import delete, event, text
 from sqlalchemy import exc as sa_exc
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from contracts.retrieval import Filters
 from contracts.storage import IndexStoreError
 from kc.db.embedding_config import EmbeddingConfigMismatchError
 from kc.db.engine import create_session_factory
 from kc.db.models import EMBEDDING_DIMENSION, EmbeddingConfig
-from kc.db.pg_index_store import PgIndexStore
+from kc.db.pg_index_store import PgIndexStore, build_vector_search_statement, ef_search_for
 from kc.indexing._provisional_contracts import Chunk, Document
 
 MODEL = "BAAI/bge-m3@5617a9f"
@@ -117,6 +120,8 @@ OPERATIONS: dict[str, Callable[[PgIndexStore], Coroutine[Any, Any, Any]]] = {
     "delete_document": lambda s: s.delete_document("u1"),
     "get_document_hashes": lambda s: s.get_document_hashes(),
     "verify_embedding_config": lambda s: s.verify_embedding_config(MODEL, EMBEDDING_DIMENSION),
+    "vector_search": lambda s: s.vector_search(_vector(), k=5),
+    "text_search": lambda s: s.text_search("configure SAML", k=5),
 }
 
 INFRASTRUCTURE_ERRORS = {
@@ -225,6 +230,42 @@ def test_verify_rejects_a_dimension_that_does_not_fit_the_column_before_the_data
     assert factory.sessions_opened == 0
 
 
+@pytest.mark.parametrize(
+    ("call", "message"),
+    [
+        (lambda s: s.vector_search(_vector(), k=0), "k must be positive"),
+        (lambda s: s.vector_search(_vector(), k=-1), "k must be positive"),
+        (lambda s: s.vector_search([1.0, 0.0, 0.0], k=5), "dimension"),
+        (lambda s: s.text_search("saml", k=0), "k must be positive"),
+    ],
+    ids=["vector-k-0", "vector-k-negative", "vector-wrong-dimension", "text-k-0"],
+)
+def test_invalid_search_raises_value_error_without_touching_the_database(
+    call: Callable[[PgIndexStore], Coroutine[Any, Any, Any]], message: str
+) -> None:
+    store, factory = _store(AssertionError("the database must not be touched"))
+    with pytest.raises(ValueError, match=message):
+        run(call(store))
+    assert factory.sessions_opened == 0
+
+
+@pytest.mark.parametrize("query", ["", "   ", "!!! ???", "-- ;"])
+def test_text_search_without_words_returns_empty_without_touching_the_database(
+    query: str,
+) -> None:
+    store, factory = _store(AssertionError("the database must not be touched"))
+    assert run(store.text_search(query)) == []
+    assert factory.sessions_opened == 0
+
+
+@pytest.mark.parametrize(
+    ("k", "expected"),
+    [(1, 40), (5, 40), (30, 40), (31, 41), (100, 110), (995, 1000), (5000, 1000)],
+)
+def test_ef_search_follows_k_within_pgvector_limits(k: int, expected: int) -> None:
+    assert ef_search_for(k) == expected
+
+
 def test_constructor_rejects_a_dimension_other_than_the_column() -> None:
     with pytest.raises(ValueError, match=r"vector\(1024\)"):
         PgIndexStore(FailingFactory(AssertionError()), dimension=512)  # type: ignore[arg-type]
@@ -263,3 +304,162 @@ def test_verify_embedding_config_records_then_guards_against_a_model_change() ->
             await engine.dispose()
 
     run(scenario())
+
+
+# --- integration: HNSW index usage and iterative scan --------------------------------------------
+
+
+def _axis(axis: int, nudge: float = 0.0) -> list[float]:
+    """Unit-ish vector pointing along `axis`; `nudge` on another axis keeps vectors distinct."""
+    vector = [0.0] * EMBEDDING_DIMENSION
+    vector[axis] = 1.0
+    vector[2] = nudge
+    return vector
+
+
+def _engine_that_must_use_indexes(url: str) -> AsyncEngine:
+    """NullPool engine whose connections disable sequential scans.
+
+    On a small test table Postgres rightly prefers a sequential scan; disabling it (for
+    THESE connections only) shows whether the query CAN be answered by the HNSW index,
+    i.e. that operator (<=>) and operator class (vector_cosine_ops) match.
+    """
+    engine = create_async_engine(url, poolclass=NullPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _no_seqscan(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("SET enable_seqscan = off")
+        cursor.close()
+
+    return engine
+
+
+async def _explain(engine: AsyncEngine, statement: Any, settings: dict[str, str]) -> str:
+    compiled = statement.compile(
+        dialect=engine.dialect, compile_kwargs={"render_postcompile": True}
+    )
+    params = {}
+    for name, value in compiled.params.items():
+        processor = compiled.binds[name].type._cached_bind_processor(engine.dialect)
+        params[name] = processor(value) if processor else value
+    async with engine.connect() as connection, connection.begin():
+        for setting, value in settings.items():
+            await connection.execute(
+                text("SELECT set_config(:s, :v, true)"), {"s": setting, "v": value}
+            )
+        result = await connection.exec_driver_sql("EXPLAIN " + str(compiled), params)
+        return "\n".join(row[0] for row in result.all())
+
+
+async def _load_narrow_filter_data(store: PgIndexStore) -> None:
+    """200 orchestration chunks right next to the query, 5 sequence chunks far away."""
+    orchestration = [
+        Chunk(
+            id=f"orch-{i:03d}",
+            document_url="test://orch",
+            text="saml",
+            heading_path=[],
+            product="orchestration",
+            version="10",
+            doc_type="how-to",
+        )
+        for i in range(200)
+    ]
+    await store.upsert_document(
+        _doc("test://orch").model_copy(update={"product": "orchestration"}),
+        orchestration,
+        [_axis(0, nudge=i / 1000) for i in range(200)],
+    )
+    sequence = [
+        Chunk(
+            id=f"seq-{i}",
+            document_url="test://seq",
+            text="saml",
+            heading_path=[],
+            product="sequence",
+            version="9",
+            doc_type="how-to",
+        )
+        for i in range(5)
+    ]
+    await store.upsert_document(
+        _doc("test://seq"), sequence, [_axis(1, nudge=i / 1000) for i in range(5)]
+    )
+
+
+async def _truncate(engine: AsyncEngine) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(text("TRUNCATE documents, chunks"))
+
+
+@pytest.mark.integration
+def test_vector_search_query_uses_the_hnsw_index() -> None:
+    """DESTRUCTIVE (writes and empties documents/chunks): test databases only."""
+    url = require_database_url()
+    require_test_database(url)
+
+    async def scenario() -> str:
+        engine = _engine_that_must_use_indexes(url)
+        try:
+            await _truncate(engine)
+            await _load_narrow_filter_data(PgIndexStore(create_session_factory(engine)))
+            statement = build_vector_search_statement(_axis(0), None, 5)
+            return await _explain(
+                engine, statement, {"hnsw.iterative_scan": "strict_order", "hnsw.ef_search": "40"}
+            )
+        finally:
+            await _truncate(engine)
+            await engine.dispose()
+
+    plan = run(scenario())
+    assert "ix_chunks_embedding_hnsw" in plan, plan
+    assert "Seq Scan on chunks" not in plan, plan
+
+
+@pytest.mark.integration
+def test_narrow_filter_still_returns_k_thanks_to_iterative_scan() -> None:
+    """DESTRUCTIVE (writes and empties documents/chunks): test databases only.
+
+    The 40 HNSW candidates nearest to the query are all orchestration, so filtering by
+    sequence leaves nothing - unless pgvector keeps scanning (iterative_scan).
+    """
+    url = require_database_url()
+    require_test_database(url)
+    narrow = Filters(products=["sequence"])
+
+    async def scenario() -> tuple[list[str], int, str]:
+        engine = _engine_that_must_use_indexes(url)
+        store = PgIndexStore(create_session_factory(engine))
+        try:
+            await _truncate(engine)
+            await _load_narrow_filter_data(store)
+
+            results = await store.vector_search(_axis(0), narrow, k=5)
+
+            # The same query WITHOUT iterative scan, for comparison.
+            async with engine.connect() as connection, connection.begin():
+                await connection.execute(
+                    text(
+                        "SELECT set_config('hnsw.iterative_scan', 'off', true), "
+                        "set_config('hnsw.ef_search', '40', true)"
+                    )
+                )
+                without = (
+                    await connection.execute(build_vector_search_statement(_axis(0), narrow, 5))
+                ).all()
+            plan = await _explain(
+                engine,
+                build_vector_search_statement(_axis(0), narrow, 5),
+                {"hnsw.iterative_scan": "strict_order", "hnsw.ef_search": "40"},
+            )
+            return [r.chunk_id for r in results], len(without), plan
+        finally:
+            await _truncate(engine)
+            await engine.dispose()
+
+    with_iterative, count_without, plan = run(scenario())
+
+    assert "ix_chunks_embedding_hnsw" in plan, plan  # the index really answered the query
+    assert count_without < 5, "without iterative_scan the narrow filter should lose results"
+    assert with_iterative == [f"seq-{i}" for i in range(5)]
