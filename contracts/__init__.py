@@ -1,21 +1,19 @@
-"""Shared contracts. Each domain has its own module; import the public names from here."""
+"""Shared contracts between domains. Changes require approval from all six owners."""
 
-from contracts.ingestion import (
-    PRODUCT_SUCCESSOR,
-    Chunk,
-    DocType,
-    Document,
-    IngestedDocument,
-    IngestionSource,
-    Product,
-)
+from .common import DocType, Product, Version
+from .retrieval import Filters, Retriever, SearchResult
+from .storage import Embedder, EmbeddingError, IndexStoreError, InputType, SearchIndex
 
 __all__ = [
-    "PRODUCT_SUCCESSOR",
-    "Chunk",
     "DocType",
-    "Document",
-    "IngestedDocument",
-    "IngestionSource",
+    "Embedder",
+    "EmbeddingError",
+    "Filters",
+    "IndexStoreError",
+    "InputType",
     "Product",
+    "Retriever",
+    "SearchIndex",
+    "SearchResult",
+    "Version",
 ]
