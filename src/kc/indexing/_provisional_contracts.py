@@ -1,109 +1,75 @@
-"""TEMPORARY stand-ins for shared contracts that do not exist yet.
+"""Single import point for contract types used by Storage & Indexing.
 
-TODO(D11): replace every definition here with imports from `contracts/` once the
-module layout (D11) is agreed. Then delete this file.
+Some types already come from the official `contracts/` package; the rest are TEMPORARY
+stand-ins until their owners add them there.
+
+TODO(D11): once Document/Chunk (Devora) and Embedder/IndexStore/EmbeddingError (Raizy)
+are in `contracts/`, replace the definitions below with imports and delete this file.
 
 Rules:
 - Import ONLY from inside `src/kc/indexing/` and from tests/indexing (Raizy's code).
-  Other domains must never import this module.
-- All Storage & Indexing code imports contract types from HERE, so the switch to
+  Other domains must import from `contracts/` directly.
+- All Storage & Indexing code imports contract types from HERE, so each switch to
   `contracts/` is a one-line change per name.
 """
 
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel
+
+# =====================================================================================
+# Official contracts (already in contracts/), re-exported
+# =====================================================================================
+from contracts.common import DocType, Product, Version
+from contracts.retrieval import Filters, SearchResult
+
+__all__ = [
+    "Chunk",
+    "DocType",
+    "Document",
+    "Embedder",
+    "EmbeddingError",
+    "Filters",
+    "IndexStore",
+    "InputType",
+    "Product",
+    "SearchResult",
+    "Version",
+]
 
 
 # =====================================================================================
-# Copied verbatim from CLAUDE.md
+# Document / Chunk: fields as in CLAUDE.md, types aligned with contracts.common.
+# Aligned with contracts.common; still provisional until Devora adds Chunk/Document to
+# contracts/ (D11).
 # =====================================================================================
-# fmt: off
 class Document(BaseModel):
     url: str
     title: str
     breadcrumb: list[str]
-    product: str            # sequence | orchestration | case-manager | opsmanager
-    version: str | None
-    doc_type: str           # how-to | release-notes | troubleshooting ...
+    product: Product
+    version: Version | None
+    doc_type: DocType
     content_md: str
     content_hash: str
+
 
 class Chunk(BaseModel):
     id: str
     document_url: str
     text: str
     heading_path: list[str]
-    product: str
-    version: str | None
-    doc_type: str
-
-class SearchResult(BaseModel):
-    chunk_id: str
-    url: str
-    title: str
-    text: str
-    score: float
-# fmt: on
-
-# =====================================================================================
-# From my storage contract draft (D2), not yet approved by the team
-# =====================================================================================
-
-# Required, keyword-only argument of Embedder.embed.
-InputType = Literal["query", "document"]
-
-# =====================================================================================
-# Filters: Agreed with Racheli (D10), 2026-11-12. Owner: Racheli.
-# Will be replaced by contracts import (D11).
-# =====================================================================================
-
-# TODO(contracts): Product, Version and DocType will be defined ONCE in the shared
-#     contracts (Racheli + Devora) and used by Document, Chunk and Filters alike.
-#     Plain `str` until then.
-Product = str  # sequence | orchestration | case-manager | opsmanager (values TBD)
-Version = str  # exact match; allowed values: "11", "10", "9", "8", "7", "4" (major only)
-DocType = str  # how-to | release-notes | troubleshooting ... (values TBD)
-
-
-class Filters(BaseModel):
-    """Search filters. Agreed with Racheli (D10), 2026-11-12. Owner: Racheli.
-
-    Semantics:
-    - a field set to None does not filter;
-    - several values in one field = OR; different fields = AND;
-    - exclude_doc_types removes chunks of those types;
-    - filtering by `versions` never returns chunks with version=None (deliberate).
-
-    Validation lives HERE (stores do not re-check): an empty list, or the same value in
-    both doc_types and exclude_doc_types, raises a ValidationError (a ValueError).
-    """
-
-    products: list[Product] | None = None
-    versions: list[Version] | None = None
-    doc_types: list[DocType] | None = None
-    exclude_doc_types: list[DocType] | None = None
-
-    @field_validator("products", "versions", "doc_types", "exclude_doc_types")
-    @classmethod
-    def _reject_empty_list(cls, value: list[str] | None, info: ValidationInfo) -> list[str] | None:
-        if value is not None and not value:
-            raise ValueError(f"{info.field_name} must be None (no filter) or a non-empty list")
-        return value
-
-    @model_validator(mode="after")
-    def _reject_include_exclude_overlap(self) -> "Filters":
-        if self.doc_types is not None and self.exclude_doc_types is not None:
-            overlap = sorted(set(self.doc_types) & set(self.exclude_doc_types))
-            if overlap:
-                raise ValueError(f"doc_types and exclude_doc_types overlap: {overlap}")
-        return self
+    product: Product
+    version: Version | None
+    doc_type: DocType
 
 
 # =====================================================================================
 # From my storage contract draft (D1-D9), not yet approved by the team
-# (defined after Filters because the protocols refer to it)
 # =====================================================================================
+
+# Required, keyword-only argument of Embedder.embed (D2).
+InputType = Literal["query", "document"]
 
 
 class EmbeddingError(RuntimeError):
