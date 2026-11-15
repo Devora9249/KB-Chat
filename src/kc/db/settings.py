@@ -20,7 +20,14 @@ class DbSettings(BaseSettings):
 
     database_url: SecretStr = Field(validation_alias="DATABASE_URL")
     db_echo_sql: bool = Field(default=False, validation_alias="DB_ECHO_SQL")
+
+    # Connection pool. Defaults = SQLAlchemy's QueuePool defaults, so behaviour is unchanged
+    # unless set explicitly. At most pool_size + max_overflow connections exist at once; a
+    # caller waits up to pool_timeout seconds for a free one, then gets a TimeoutError.
     db_pool_size: int = Field(default=5, ge=1, validation_alias="DB_POOL_SIZE")
+    # >= 0 on purpose: SQLAlchemy's -1 ("unlimited") could exhaust the database under load.
+    db_max_overflow: int = Field(default=10, ge=0, validation_alias="DB_MAX_OVERFLOW")
+    db_pool_timeout: float = Field(default=30.0, gt=0, validation_alias="DB_POOL_TIMEOUT")
 
     @field_validator("database_url")
     @classmethod

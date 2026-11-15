@@ -25,6 +25,8 @@ def create_engine(settings: DbSettings) -> AsyncEngine:
         settings.database_url.get_secret_value(),
         echo=settings.db_echo_sql,
         pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
         pool_pre_ping=True,  # transparently replace connections the server has dropped
     )
 
