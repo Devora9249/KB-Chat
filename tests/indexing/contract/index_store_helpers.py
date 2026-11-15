@@ -1,23 +1,27 @@
-"""Shared helpers for IndexStore contract tests (owner: Raizy)."""
+"""Shared helpers for the SearchIndex / IndexStore contract tests (owner: Raizy)."""
 
 import asyncio
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import Any, Protocol
 
-from kc.indexing._provisional_contracts import (
-    Chunk,
-    DocType,
-    Document,
-    IndexStore,
-    Product,
-    SearchResult,
-    Version,
-)
+from contracts.common import DocType, Product, Version
+from contracts.retrieval import SearchResult
+from contracts.storage import SearchIndex
+from kc.indexing._provisional_contracts import Chunk, Document, IndexStore
+
+DIM = 3
+
+# A document with its chunks and one vector per chunk, ready to be indexed.
+IndexedDocument = tuple[Document, list[Chunk], list[list[float]]]
 
 # A factory creates a NEW, EMPTY store with the given vector dimension.
 StoreFactory = Callable[[int], IndexStore]
 
-DIM = 3
+
+class SearchIndexFactory(Protocol):
+    """Creates a NEW SearchIndex that already contains `documents` (read-only use)."""
+
+    def __call__(self, documents: list[IndexedDocument], dimension: int = DIM) -> SearchIndex: ...
 
 
 def run[T](coro: Coroutine[Any, Any, T]) -> T:

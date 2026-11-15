@@ -13,7 +13,9 @@ import asyncio
 
 from index_store_helpers import make_chunk, make_doc
 
-from kc.indexing._provisional_contracts import Chunk, Document, Embedder, IndexStore, SearchResult
+from contracts.retrieval import SearchResult
+from contracts.storage import Embedder
+from kc.indexing._provisional_contracts import Chunk, Document, IndexStore
 from kc.indexing.vector_math import cosine_similarity
 
 QUERY = [1.0, 0.0, 0.0]

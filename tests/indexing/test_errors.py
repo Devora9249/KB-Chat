@@ -1,9 +1,9 @@
-"""Error contract of Storage & Indexing (consumed by Racheli's RetrievalError)."""
+"""Error contract of Storage & Indexing (contracts.storage; consumed by RetrievalError)."""
 
 import pytest
 
-from kc.indexing import _provisional_contracts as contracts
-from kc.indexing._provisional_contracts import EmbeddingError, IndexStoreError
+import contracts
+from contracts.storage import EmbeddingError, IndexStoreError
 
 
 @pytest.mark.parametrize("error_type", [EmbeddingError, IndexStoreError])
@@ -20,8 +20,9 @@ def test_errors_are_distinct() -> None:
     assert not issubclass(IndexStoreError, EmbeddingError)
 
 
-def test_errors_are_exported_from_the_single_import_point() -> None:
+def test_errors_are_exported_from_contracts_package() -> None:
     assert {"EmbeddingError", "IndexStoreError"} <= set(contracts.__all__)
+    assert contracts.IndexStoreError is IndexStoreError
 
 
 def test_wrapping_keeps_the_original_error_in_cause() -> None:

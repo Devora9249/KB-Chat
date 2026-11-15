@@ -1,17 +1,22 @@
-"""Fixtures for the IndexStore and Embedder contract test suites (owner: Raizy).
+"""Fixtures for the storage contract test suites (owner: Raizy).
 
-Every test using `store` / `make_store` runs once per entry in IMPLEMENTATIONS, and every
-test using `embedder` runs once per entry in EMBEDDER_IMPLEMENTATIONS.
-To add an implementation (e.g. PgIndexStore, BgeM3Embedder), add one entry.
-Other teams are welcome to add contract tests via PR.
+- `make_search_index`: a SearchIndex already loaded with given documents. Search tests use
+  ONLY vector_search / text_search on it (contracts.storage.SearchIndex).
+- `store` / `make_store`: a fresh, empty IndexStore for write tests (provisional
+  IndexStore = SearchIndex + IndexWriter).
+- `embedder`: one per entry in EMBEDDER_IMPLEMENTATIONS (contracts.storage.Embedder).
+
+Every test runs once per registered implementation. To add one (e.g. PgIndexStore,
+BgeM3Embedder), add one entry. Other teams are welcome to add contract tests via PR.
 """
 
 from collections.abc import Callable
 
 import pytest
-from index_store_helpers import DIM, StoreFactory
+from index_store_helpers import DIM, IndexedDocument, SearchIndexFactory, StoreFactory, run
 
-from kc.indexing._provisional_contracts import Embedder, IndexStore
+from contracts.storage import Embedder, SearchIndex
+from kc.indexing._provisional_contracts import IndexStore
 from kc.indexing.fake_embedder import FakeEmbedder
 from kc.indexing.in_memory_index_store import InMemoryIndexStore
 
@@ -28,7 +33,7 @@ IMPLEMENTATIONS: dict[str, StoreFactory] = {
 
 @pytest.fixture(params=sorted(IMPLEMENTATIONS))
 def make_store(request: pytest.FixtureRequest) -> StoreFactory:
-    """Factory for a fresh store of the current implementation (any dimension)."""
+    """Factory for a fresh, empty store of the current implementation (any dimension)."""
     factory: StoreFactory = IMPLEMENTATIONS[request.param]
     return factory
 
@@ -37,6 +42,23 @@ def make_store(request: pytest.FixtureRequest) -> StoreFactory:
 def store(make_store: StoreFactory) -> IndexStore:
     """A fresh, empty store with dimension DIM (3)."""
     return make_store(DIM)
+
+
+@pytest.fixture
+def make_search_index(make_store: StoreFactory) -> SearchIndexFactory:
+    """Factory for a SearchIndex that already contains the given documents.
+
+    Loading goes through the implementation's own writer; the returned object is typed
+    as SearchIndex so tests can only search it.
+    """
+
+    def factory(documents: list[IndexedDocument], dimension: int = DIM) -> SearchIndex:
+        store = make_store(dimension)
+        for document, chunks, vectors in documents:
+            run(store.upsert_document(document, chunks, vectors))
+        return store
+
+    return factory
 
 
 # TODO(BgeM3Embedder): add "bge_m3" here, marked real_model (runs only with KC_REAL_EMBEDDER=1).

@@ -18,13 +18,8 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from kc.indexing._provisional_contracts import (
-    Chunk,
-    Document,
-    Embedder,
-    EmbeddingError,
-    IndexStore,
-)
+from contracts.storage import Embedder, EmbeddingError
+from kc.indexing._provisional_contracts import Chunk, Document, IndexStore
 
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,7 @@
-"""In-memory IndexStore for tests and local development (draft storage contract D6-D9).
+"""In-memory IndexStore for tests and local development.
+
+Implements contracts.storage.SearchIndex and the provisional IndexWriter / IndexStore
+(see _protocol_checks.py for the mypy proof).
 
 Storage: dict url -> (Document, [(Chunk, vector), ...]).
 
@@ -22,7 +25,8 @@ IndexStoreError, because it has no infrastructure (no connection, no database).
 import re
 from dataclasses import dataclass
 
-from kc.indexing._provisional_contracts import Chunk, Document, Filters, SearchResult
+from contracts.retrieval import Filters, SearchResult
+from kc.indexing._provisional_contracts import Chunk, Document
 from kc.indexing.vector_math import cosine_similarity
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)

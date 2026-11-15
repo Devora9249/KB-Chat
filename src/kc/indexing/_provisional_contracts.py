@@ -1,42 +1,26 @@
-"""Single import point for contract types used by Storage & Indexing.
+"""TEMPORARY contract types that still wait for Document/Chunk in contracts/ (D11, Devora).
 
-Some types already come from the official `contracts/` package; the rest are TEMPORARY
-stand-ins until their owners add them there.
+Everything else is official and must be imported from contracts/ directly:
+- contracts.storage: Embedder, SearchIndex, InputType, EmbeddingError, IndexStoreError
+- contracts.retrieval: Filters, SearchResult
+- contracts.common: Product, DocType, Version
 
-TODO(D11): once Document/Chunk (Devora) and Embedder/IndexStore/EmbeddingError (Raizy)
-are in `contracts/`, replace the definitions below with imports and delete this file.
+TODO(D11): once Devora adds Document and Chunk to contracts/, move IndexWriter and
+IndexStore to contracts/storage.py and delete this file.
 
 Rules:
 - Import ONLY from inside `src/kc/indexing/` and from tests/indexing (Raizy's code).
-  Other domains must import from `contracts/` directly.
-- All Storage & Indexing code imports contract types from HERE, so each switch to
-  `contracts/` is a one-line change per name.
+  Other domains must use contracts/ only (consumers that only search need SearchIndex).
 """
 
-from typing import Literal, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
-# =====================================================================================
-# Official contracts (already in contracts/), re-exported
-# =====================================================================================
 from contracts.common import DocType, Product, Version
-from contracts.retrieval import Filters, SearchResult
+from contracts.storage import SearchIndex
 
-__all__ = [
-    "Chunk",
-    "DocType",
-    "Document",
-    "Embedder",
-    "EmbeddingError",
-    "Filters",
-    "IndexStore",
-    "IndexStoreError",
-    "InputType",
-    "Product",
-    "SearchResult",
-    "Version",
-]
+__all__ = ["Chunk", "Document", "IndexStore", "IndexWriter"]
 
 
 # =====================================================================================
@@ -66,69 +50,28 @@ class Chunk(BaseModel):
 
 
 # =====================================================================================
-# From my storage contract draft (D1-D9), not yet approved by the team
+# Write side of the index (draft D6-D7). Moves to contracts/storage.py with Document/Chunk.
 # =====================================================================================
 
-# Required, keyword-only argument of Embedder.embed (D2).
-InputType = Literal["query", "document"]
-
-
-class EmbeddingError(RuntimeError):
-    """The embedding provider failed after the embedder's internal retries were exhausted."""
-
-
-class IndexStoreError(RuntimeError):
-    """Infrastructure failure inside an IndexStore (connection, timeout, database error).
-
-    Implementations wrap the original error with `raise IndexStoreError(...) from e`, so it
-    stays available in `__cause__`.
-    """
-
 
 @runtime_checkable
-class Embedder(Protocol):
-    """See storage contract draft D1-D5: one unit-length vector per text, same order.
+class IndexWriter(Protocol):
+    """Write side of the index.
 
-    Concurrency: one instance must be safe to use from several concurrent async calls.
-    An implementation may run the calls one after another (e.g. with a Lock), but must
-    never mix up their results.
+    - upsert_document atomically replaces ALL chunks of the document (chunks that
+      disappeared on re-crawl are removed) and keeps title / content_hash. Raises
+      ValueError if len(chunks) != len(vectors), if a vector has the wrong dimension, or if
+      a chunk's document_url != document.url; on ValueError nothing is changed.
+    - delete_document is a no-op if the document does not exist.
+    - get_document_hashes returns url -> content_hash of everything indexed.
 
-    Errors:
-    - EmbeddingError: raised only after the embedder's internal retries have failed.
-    - ValueError: invalid input (a bug in the caller); NOT wrapped.
-    - asyncio.CancelledError: never wrapped (cancellation must propagate).
-    """
-
-    @property
-    def model_name(self) -> str: ...
-
-    @property
-    def dimension(self) -> int: ...
-
-    async def embed(self, texts: list[str], *, input_type: InputType) -> list[list[float]]: ...
-
-
-@runtime_checkable
-class IndexStore(Protocol):
-    """See storage contract draft D6-D9.
-
-    Concurrency: one instance must be safe to use from several concurrent async calls
-    (one IndexStore lives for the whole application). A search running during an
-    upsert_document of the same document sees either the old or the new version, never
-    a mix.
+    Concurrency and errors: same rules as contracts.storage.SearchIndex (safe for
+    concurrent async calls; ValueError not wrapped; infrastructure failures wrapped in
+    IndexStoreError with `raise ... from e`; no retries; CancelledError never wrapped).
 
     Future PgIndexStore: receives an async_sessionmaker in its constructor (the Engine
     is created and disposed by the application), opens a short session per call, and
     runs upsert_document in a single transaction.
-
-    Errors:
-    - ValueError: invalid input (a bug in the caller, e.g. k <= 0, wrong vector
-      dimension, chunk of another document); NOT wrapped.
-    - IndexStoreError: infrastructure failure (connection, timeout, database error).
-      Implementations wrap it with `raise IndexStoreError(...) from e`, so the original
-      error is kept in `__cause__`.
-    - No retries inside an IndexStore: whether to retry is the caller's decision.
-    - asyncio.CancelledError: never wrapped (cancellation must propagate).
     """
 
     async def upsert_document(
@@ -139,10 +82,11 @@ class IndexStore(Protocol):
 
     async def get_document_hashes(self) -> dict[str, str]: ...
 
-    async def vector_search(
-        self, vector: list[float], filters: Filters | None = None, *, k: int = 10
-    ) -> list[SearchResult]: ...
 
-    async def text_search(
-        self, query: str, filters: Filters | None = None, *, k: int = 10
-    ) -> list[SearchResult]: ...
+@runtime_checkable
+class IndexStore(SearchIndex, IndexWriter, Protocol):
+    """Full index: search (contracts.storage.SearchIndex) + write (IndexWriter).
+
+    A search running during upsert_document of the same document sees either the old or
+    the new version, never a mix.
+    """
