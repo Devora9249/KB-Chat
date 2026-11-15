@@ -96,6 +96,68 @@ def test_invalid_upsert_raises_and_changes_nothing(writer: WriterUnderTest, case
     assert snapshot(writer) == before
 
 
+# --- D12: chunk.id is unique across the whole index ---------------------------------------
+
+
+def test_duplicate_ids_in_one_upsert_raise_and_change_nothing(writer: WriterUnderTest) -> None:
+    v = writer.unit()
+    run(writer.writer.upsert_document(make_doc("u1"), [make_chunk("old", "u1")], [v]))
+    before = snapshot(writer)
+
+    with pytest.raises(ValueError, match=r"duplicate chunk ids .*\['dup'\]"):
+        run(
+            writer.writer.upsert_document(
+                make_doc("u1", content_hash="new"),
+                [make_chunk("dup", "u1"), make_chunk("x", "u1"), make_chunk("dup", "u1")],
+                [v, v, v],
+            )
+        )
+
+    assert snapshot(writer) == before
+
+
+def test_id_owned_by_another_document_raises_and_changes_nothing(
+    writer: WriterUnderTest,
+) -> None:
+    v = writer.unit()
+    run(
+        writer.writer.upsert_document(
+            make_doc("u1", content_hash="a"), [make_chunk("c1", "u1")], [v]
+        )
+    )
+    run(
+        writer.writer.upsert_document(
+            make_doc("u2", content_hash="b"), [make_chunk("c2", "u2")], [v]
+        )
+    )
+    before = snapshot(writer)
+
+    # u2 tries to take "c1", which belongs to u1 (and would also drop its own "c2").
+    with pytest.raises(ValueError, match="already used by another document"):
+        run(
+            writer.writer.upsert_document(
+                make_doc("u2", content_hash="b2"), [make_chunk("c1", "u2")], [v]
+            )
+        )
+
+    assert snapshot(writer) == before
+
+
+def test_reupserting_a_document_with_its_own_ids_is_allowed(writer: WriterUnderTest) -> None:
+    v = writer.unit()
+    chunks = [make_chunk("c1", "u1", "v1 text"), make_chunk("c2", "u1", "v1 text")]
+    run(writer.writer.upsert_document(make_doc("u1", content_hash="v1"), chunks, [v, v]))
+
+    updated = [make_chunk("c1", "u1", "v2 text"), make_chunk("c2", "u1", "v2 text")]
+    run(writer.writer.upsert_document(make_doc("u1", content_hash="v2"), updated, [v, v]))
+
+    assert [(cid, body) for cid, _, body, _ in writer.stored()] == [
+        ("c1", "v2 text"),
+        ("c2", "v2 text"),
+    ]
+    assert run(writer.writer.get_document_hashes()) == {"u1": "v2"}
+
+
 def test_writer_keeps_copies_of_inputs(writer: WriterUnderTest) -> None:
     vector = writer.unit()
     chunk = make_chunk("c1", "u1", "original")

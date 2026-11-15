@@ -90,6 +90,21 @@ class InMemoryIndexStore:
     ) -> None:
         # 1. Validate everything before touching the store.
         validate_upsert(document, chunks, vectors, self._dimension)
+        # chunk.id is unique across the whole index (D12): no other document may own one of
+        # these ids (Postgres enforces the same with the chunks primary key).
+        new_ids = {chunk.id for chunk in chunks}
+        taken = sorted(
+            chunk.id
+            for url, entry in self._documents.items()
+            if url != document.url
+            for chunk, _vector in entry.entries
+            if chunk.id in new_ids
+        )
+        if taken:
+            raise ValueError(
+                f"chunk ids already used by another document: {taken} "
+                "(chunk.id must be unique across the whole index, D12)"
+            )
 
         # 2. Build the new entry aside, from copies.
         stored = _StoredDocument(

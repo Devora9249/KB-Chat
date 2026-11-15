@@ -163,6 +163,39 @@ def test_cancellation_is_never_wrapped(operation: str) -> None:
         run(OPERATIONS[operation](store))
 
 
+# --- D12: chunk id owned by another document (detected by the database) --------------------------
+
+
+class _Diag:
+    def __init__(self, constraint_name: str, message_detail: str) -> None:
+        self.constraint_name = constraint_name
+        self.message_detail = message_detail
+
+
+class _DbError(Exception):
+    """Stands in for psycopg.errors.UniqueViolation (carries .diag like psycopg does)."""
+
+    def __init__(self, constraint_name: str) -> None:
+        super().__init__("duplicate key value violates unique constraint")
+        self.diag = _Diag(constraint_name, "Key (id)=(c1) already exists.")
+
+
+def test_chunk_primary_key_violation_becomes_value_error_with_cause() -> None:
+    error = sa_exc.IntegrityError("INSERT INTO chunks ...", {}, _DbError("pk_chunks"))
+    store, _ = _store(error)
+    with pytest.raises(ValueError, match=r"already used by another document.*\(c1\)") as info:
+        run(store.upsert_document(_doc(), [_chunk()], [_vector()]))
+    assert info.value.__cause__ is error
+
+
+def test_other_integrity_errors_stay_infrastructure_errors() -> None:
+    error = sa_exc.IntegrityError("INSERT ...", {}, _DbError("some_other_constraint"))
+    store, _ = _store(error)
+    with pytest.raises(IndexStoreError) as info:
+        run(store.upsert_document(_doc(), [_chunk()], [_vector()]))
+    assert info.value.__cause__ is error
+
+
 # --- checks before any database access ----------------------------------------------------------
 
 
@@ -172,8 +205,9 @@ def test_cancellation_is_never_wrapped(operation: str) -> None:
         ([_chunk("a"), _chunk("b")], [_vector()], "chunks but"),
         ([_chunk("a")], [[1.0, 0.0, 0.0]], "dimension"),
         ([_chunk("a", url="OTHER")], [_vector()], "url"),
+        ([_chunk("a"), _chunk("a")], [_vector(), _vector()], "duplicate chunk ids"),
     ],
-    ids=["length-mismatch", "wrong-dimension", "wrong-document-url"],
+    ids=["length-mismatch", "wrong-dimension", "wrong-document-url", "duplicate-id"],
 )
 def test_invalid_upsert_raises_value_error_without_touching_the_database(
     chunks: list[Chunk], vectors: list[list[float]], message: str

@@ -20,12 +20,15 @@ once at startup. It reuses kc.db.embedding_config (records the model on first us
 EmbeddingConfigMismatchError if the index was built with another model or dimension).
 
 Errors:
-- ValueError: invalid input; raised before any database access; never wrapped.
+- ValueError: invalid input, never wrapped. Raised before any database access, except
+  one case the database detects: a chunk id already used by a chunk of ANOTHER document
+  (chunk.id is unique across the whole index, D12). That IntegrityError on the chunks
+  primary key (pk_chunks) becomes ValueError (`raise ... from e`); the transaction is
+  rolled back, so nothing changes.
 - IndexStoreError (`raise ... from e`): ONLY infrastructure failures - SQLAlchemy
   DBAPIError and its OperationalError / InterfaceError, psycopg OperationalError /
   InterfaceError, and SQLAlchemy's pool TimeoutError (no free connection in time).
-  Note: a duplicate chunk id (D12) surfaces as IntegrityError, a DBAPIError, and is
-  therefore wrapped too until D12 decides how duplicates are reported.
+  Any other IntegrityError (not pk_chunks) is a DBAPIError and stays wrapped.
 - No retries here: the caller decides. asyncio.CancelledError is never caught.
 """
 
@@ -52,6 +55,16 @@ INFRASTRUCTURE_ERRORS: tuple[type[BaseException], ...] = (
     psycopg.OperationalError,
     psycopg.InterfaceError,
 )
+
+
+# Name of the chunks primary key (migration 0003, op.f("pk_chunks")).
+CHUNKS_PRIMARY_KEY = "pk_chunks"
+
+
+def _is_chunk_id_conflict(error: sa_exc.IntegrityError) -> bool:
+    """True if the database rejected a chunk id that is already used (pk_chunks)."""
+    diagnostics = getattr(error.orig, "diag", None)  # psycopg error details
+    return getattr(diagnostics, "constraint_name", None) == CHUNKS_PRIMARY_KEY
 
 
 @asynccontextmanager
@@ -139,12 +152,24 @@ class PgIndexStore:
         ]
 
         async with _infrastructure_errors("upsert_document"):
-            async with self._session_factory() as session, session.begin():
-                await session.execute(upsert_document)
-                await session.execute(delete(ChunkRow).where(ChunkRow.document_url == document.url))
-                if chunk_rows:
-                    await session.execute(insert(ChunkRow), chunk_rows)
-            # session.begin() commits here, or rolls back if anything above raised.
+            try:
+                async with self._session_factory() as session, session.begin():
+                    await session.execute(upsert_document)
+                    await session.execute(
+                        delete(ChunkRow).where(ChunkRow.document_url == document.url)
+                    )
+                    if chunk_rows:
+                        await session.execute(insert(ChunkRow), chunk_rows)
+                # session.begin() commits here, or rolls back if anything above raised.
+            except sa_exc.IntegrityError as e:
+                if not _is_chunk_id_conflict(e):
+                    raise  # any other integrity error: wrapped in IndexStoreError below
+                detail = getattr(getattr(e.orig, "diag", None), "message_detail", None)
+                raise ValueError(
+                    f"chunk id already used by another document while upserting "
+                    f"{document.url!r} (chunk.id must be unique across the whole index, D12)"
+                    + (f": {detail}" if detail else "")
+                ) from e
 
     async def delete_document(self, url: str) -> None:
         """No-op if the document does not exist; its chunks go with it (ON DELETE CASCADE)."""
