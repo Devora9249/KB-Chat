@@ -78,7 +78,12 @@ class EmbeddingError(RuntimeError):
 
 @runtime_checkable
 class Embedder(Protocol):
-    """See storage contract draft D1-D5: one unit-length vector per text, same order."""
+    """See storage contract draft D1-D5: one unit-length vector per text, same order.
+
+    Concurrency: one instance must be safe to use from several concurrent async calls.
+    An implementation may run the calls one after another (e.g. with a Lock), but must
+    never mix up their results.
+    """
 
     @property
     def model_name(self) -> str: ...
@@ -91,7 +96,17 @@ class Embedder(Protocol):
 
 @runtime_checkable
 class IndexStore(Protocol):
-    """See storage contract draft D6-D9."""
+    """See storage contract draft D6-D9.
+
+    Concurrency: one instance must be safe to use from several concurrent async calls
+    (one IndexStore lives for the whole application). A search running during an
+    upsert_document of the same document sees either the old or the new version, never
+    a mix.
+
+    Future PgIndexStore: receives an async_sessionmaker in its constructor (the Engine
+    is created and disposed by the application), opens a short session per call, and
+    runs upsert_document in a single transaction.
+    """
 
     async def upsert_document(
         self, document: Document, chunks: list[Chunk], vectors: list[list[float]]

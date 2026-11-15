@@ -1,14 +1,18 @@
-"""Fixtures for the IndexStore contract test suite (owner: Raizy).
+"""Fixtures for the IndexStore and Embedder contract test suites (owner: Raizy).
 
-Every test in this folder runs once per implementation in IMPLEMENTATIONS.
-To add an implementation (e.g. PgIndexStore), add one entry that returns a NEW, EMPTY store.
+Every test using `store` / `make_store` runs once per entry in IMPLEMENTATIONS, and every
+test using `embedder` runs once per entry in EMBEDDER_IMPLEMENTATIONS.
+To add an implementation (e.g. PgIndexStore, BgeM3Embedder), add one entry.
 Other teams are welcome to add contract tests via PR.
 """
+
+from collections.abc import Callable
 
 import pytest
 from index_store_helpers import DIM, StoreFactory
 
-from kc.indexing._provisional_contracts import IndexStore
+from kc.indexing._provisional_contracts import Embedder, IndexStore
+from kc.indexing.fake_embedder import FakeEmbedder
 from kc.indexing.in_memory_index_store import InMemoryIndexStore
 
 
@@ -33,3 +37,15 @@ def make_store(request: pytest.FixtureRequest) -> StoreFactory:
 def store(make_store: StoreFactory) -> IndexStore:
     """A fresh, empty store with dimension DIM (3)."""
     return make_store(DIM)
+
+
+# TODO(BgeM3Embedder): add "bge_m3" here, marked real_model (runs only with KC_REAL_EMBEDDER=1).
+EMBEDDER_IMPLEMENTATIONS: dict[str, Callable[[], Embedder]] = {
+    "fake": lambda: FakeEmbedder(dimension=64),
+}
+
+
+@pytest.fixture(params=sorted(EMBEDDER_IMPLEMENTATIONS))
+def embedder(request: pytest.FixtureRequest) -> Embedder:
+    """A fresh embedder of the current implementation."""
+    return EMBEDDER_IMPLEMENTATIONS[request.param]()
