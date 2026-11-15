@@ -43,6 +43,10 @@ class Embedder(Protocol):
       any number of texts;
     - never returns partial results.
 
+    `model_name` must identify the model AND its version unambiguously (e.g.
+    "BAAI/bge-m3@5617a9f"), because changing it requires a full re-index; callers that use
+    it as a key for a cache or for the re-index guard can rely on that.
+
     `input_type`: callers MUST pass it (it is required and keyword-only, so mypy catches
     a missing one): "query" when searching, "document" when indexing. An implementation
     MAY ignore it if its model does not distinguish the two (e.g. bge-m3).
