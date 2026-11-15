@@ -83,6 +83,19 @@ def ef_search_for(k: int) -> int:
     return min(MAX_EF_SEARCH, max(DEFAULT_EF_SEARCH, k + TIE_MARGIN))
 
 
+def vector_search_settings(k: int) -> dict[str, str]:
+    """pgvector settings vector_search applies, transaction-local, for a top-k query.
+
+    Single source of truth, also used by tests that run the statement directly.
+    """
+    return {"hnsw.iterative_scan": "strict_order", "hnsw.ef_search": str(ef_search_for(k))}
+
+
+def apply_settings_statement(settings: dict[str, str]) -> Select[Any]:
+    """SELECT set_config(name, value, true), ... - i.e. SET LOCAL with bound parameters."""
+    return select(*(func.set_config(name, value, True) for name, value in settings.items()))
+
+
 def _check_k(k: int) -> None:
     if k <= 0:
         raise ValueError(f"k must be positive, got {k}")
@@ -311,12 +324,7 @@ class PgIndexStore:
         async with _infrastructure_errors("vector_search"):
             async with self._session_factory() as session, session.begin():
                 # Transaction-local (== SET LOCAL): never leaks into other requests.
-                await session.execute(
-                    select(
-                        func.set_config("hnsw.iterative_scan", "strict_order", True),
-                        func.set_config("hnsw.ef_search", str(ef_search_for(k)), True),
-                    )
-                )
+                await session.execute(apply_settings_statement(vector_search_settings(k)))
                 rows = await session.execute(statement)
                 return [_to_result(row) for row in rows.all()]
 

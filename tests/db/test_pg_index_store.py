@@ -16,15 +16,23 @@ import pytest
 from db_test_support import require_database_url, require_test_database
 from sqlalchemy import delete, event, text
 from sqlalchemy import exc as sa_exc
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.pool import NullPool
+from sqlalchemy.sql.expression import ClauseElement, Executable
 
 from contracts.retrieval import Filters
 from contracts.storage import IndexStoreError
 from kc.db.embedding_config import EmbeddingConfigMismatchError
 from kc.db.engine import create_session_factory
 from kc.db.models import EMBEDDING_DIMENSION, EmbeddingConfig
-from kc.db.pg_index_store import PgIndexStore, build_vector_search_statement, ef_search_for
+from kc.db.pg_index_store import (
+    PgIndexStore,
+    apply_settings_statement,
+    build_vector_search_statement,
+    ef_search_for,
+    vector_search_settings,
+)
 from kc.indexing._provisional_contracts import Chunk, Document
 
 MODEL = "BAAI/bge-m3@5617a9f"
@@ -335,21 +343,27 @@ def _engine_that_must_use_indexes(url: str) -> AsyncEngine:
     return engine
 
 
-async def _explain(engine: AsyncEngine, statement: Any, settings: dict[str, str]) -> str:
-    compiled = statement.compile(
-        dialect=engine.dialect, compile_kwargs={"render_postcompile": True}
-    )
-    params = {}
-    for name, value in compiled.params.items():
-        processor = compiled.binds[name].type._cached_bind_processor(engine.dialect)
-        params[name] = processor(value) if processor else value
-    async with engine.connect() as connection, connection.begin():
-        for setting, value in settings.items():
-            await connection.execute(
-                text("SELECT set_config(:s, :v, true)"), {"s": setting, "v": value}
-            )
-        result = await connection.exec_driver_sql("EXPLAIN " + str(compiled), params)
-        return "\n".join(row[0] for row in result.all())
+class Explain(Executable, ClauseElement):
+    """`EXPLAIN <statement>` as a SQLAlchemy construct (the @compiles recipe).
+
+    Executed like any statement, so SQLAlchemy binds the parameters itself: expanding IN
+    lists, pgvector's Vector type, ... - no hand-made parameter handling.
+    """
+
+    inherit_cache = False
+
+    def __init__(self, statement: Any) -> None:
+        self.statement = statement
+
+
+@compiles(Explain, "postgresql")
+def _compile_explain(element: Explain, compiler: Any, **kw: Any) -> str:
+    return "EXPLAIN " + compiler.process(element.statement, **kw)
+
+
+async def _plan(connection: AsyncConnection, statement: Any) -> str:
+    result = await connection.execute(Explain(statement))
+    return "\n".join(row[0] for row in result.all())
 
 
 async def _load_narrow_filter_data(store: PgIndexStore) -> None:
@@ -404,10 +418,9 @@ def test_vector_search_query_uses_the_hnsw_index() -> None:
         try:
             await _truncate(engine)
             await _load_narrow_filter_data(PgIndexStore(create_session_factory(engine)))
-            statement = build_vector_search_statement(_axis(0), None, 5)
-            return await _explain(
-                engine, statement, {"hnsw.iterative_scan": "strict_order", "hnsw.ef_search": "40"}
-            )
+            async with engine.connect() as connection, connection.begin():
+                await connection.execute(apply_settings_statement(vector_search_settings(5)))
+                return await _plan(connection, build_vector_search_statement(_axis(0), None, 5))
         finally:
             await _truncate(engine)
             await engine.dispose()
@@ -418,48 +431,93 @@ def test_vector_search_query_uses_the_hnsw_index() -> None:
 
 
 @pytest.mark.integration
-def test_narrow_filter_still_returns_k_thanks_to_iterative_scan() -> None:
+def test_narrow_filter_returns_k_through_vector_search() -> None:
     """DESTRUCTIVE (writes and empties documents/chunks): test databases only.
 
-    The 40 HNSW candidates nearest to the query are all orchestration, so filtering by
-    sequence leaves nothing - unless pgvector keeps scanning (iterative_scan).
+    The user-facing guarantee: 5 of 205 chunks match the filter, and vector_search returns
+    exactly those 5, whatever plan Postgres picks (HNSW + iterative scan, or the B-tree
+    index on product followed by an exact sort).
     """
     url = require_database_url()
     require_test_database(url)
-    narrow = Filters(products=["sequence"])
 
-    async def scenario() -> tuple[list[str], int, str]:
-        engine = _engine_that_must_use_indexes(url)
+    async def scenario() -> list[str]:
+        engine = create_async_engine(url, poolclass=NullPool)
         store = PgIndexStore(create_session_factory(engine))
         try:
             await _truncate(engine)
             await _load_narrow_filter_data(store)
+            results = await store.vector_search(_axis(0), Filters(products=["sequence"]), k=5)
+            return [r.chunk_id for r in results]
+        finally:
+            await _truncate(engine)
+            await engine.dispose()
 
-            results = await store.vector_search(_axis(0), narrow, k=5)
+    assert run(scenario()) == [f"seq-{i}" for i in range(5)]
 
-            # The same query WITHOUT iterative scan, for comparison.
-            async with engine.connect() as connection, connection.begin():
-                await connection.execute(
-                    text(
-                        "SELECT set_config('hnsw.iterative_scan', 'off', true), "
-                        "set_config('hnsw.ef_search', '40', true)"
-                    )
-                )
-                without = (
-                    await connection.execute(build_vector_search_statement(_axis(0), narrow, 5))
-                ).all()
-            plan = await _explain(
-                engine,
-                build_vector_search_statement(_axis(0), narrow, 5),
-                {"hnsw.iterative_scan": "strict_order", "hnsw.ef_search": "40"},
-            )
-            return [r.chunk_id for r in results], len(without), plan
+
+@pytest.mark.integration
+def test_iterative_scan_is_what_keeps_k_results_when_hnsw_is_the_only_path() -> None:
+    """DESTRUCTIVE (writes and empties documents/chunks): test databases only.
+
+    For a narrow filter Postgres may rightly answer from the B-tree index on product
+    (exact, no HNSW involved). To test iterative_scan itself, this transaction temporarily
+    DROPs that B-tree index (and sequential scans are off), so HNSW is the only path. DDL in
+    Postgres is transactional: the transaction ends with ROLLBACK and the index is back.
+
+    The 40 HNSW candidates nearest to the query are all orchestration: without iterative
+    scan the sequence filter loses results; with vector_search's settings it returns all 5.
+    """
+    url = require_database_url()
+    require_test_database(url)
+    narrow = Filters(products=["sequence"])
+    statement = build_vector_search_statement(_axis(0), narrow, 5)
+    without_iterative = {**vector_search_settings(5), "hnsw.iterative_scan": "off"}
+
+    async def scenario() -> tuple[list[str], int, str]:
+        engine = _engine_that_must_use_indexes(url)
+        try:
+            await _truncate(engine)
+            await _load_narrow_filter_data(PgIndexStore(create_session_factory(engine)))
+            async with engine.connect() as connection:
+                transaction = await connection.begin()
+                try:
+                    await connection.execute(text("DROP INDEX ix_chunks_product"))
+
+                    await connection.execute(apply_settings_statement(without_iterative))
+                    count_without = len((await connection.execute(statement)).all())
+
+                    await connection.execute(apply_settings_statement(vector_search_settings(5)))
+                    with_iterative = [row.id for row in (await connection.execute(statement)).all()]
+                    plan = await _plan(connection, statement)
+                finally:
+                    await transaction.rollback()  # the B-tree index comes back
+            return with_iterative, count_without, plan
         finally:
             await _truncate(engine)
             await engine.dispose()
 
     with_iterative, count_without, plan = run(scenario())
 
-    assert "ix_chunks_embedding_hnsw" in plan, plan  # the index really answered the query
+    assert "ix_chunks_embedding_hnsw" in plan, plan  # HNSW really answered the query
     assert count_without < 5, "without iterative_scan the narrow filter should lose results"
     assert with_iterative == [f"seq-{i}" for i in range(5)]
+
+
+@pytest.mark.integration
+def test_b_tree_index_on_product_still_exists_after_the_rollback() -> None:
+    """Guards the previous test: its DROP INDEX must have been rolled back."""
+    url = require_database_url()
+
+    async def scenario() -> list[tuple[Any, ...]]:
+        engine = create_async_engine(url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text("SELECT indexname FROM pg_indexes WHERE indexname = 'ix_chunks_product'")
+                )
+                return [tuple(row) for row in result.all()]
+        finally:
+            await engine.dispose()
+
+    assert run(scenario()) == [("ix_chunks_product",)]
