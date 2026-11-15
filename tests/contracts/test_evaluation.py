@@ -31,7 +31,6 @@ def test_product_and_reference_answer_accept_none() -> None:
 
 @pytest.mark.parametrize("missing", ["question", "expected_urls", "product", "reference_answer"])
 def test_missing_field_fails(missing: str) -> None:
-    # Every field is required; product and reference_answer may be None but must be present.
     data = make_case().model_dump()
     del data[missing]
     with pytest.raises(ValidationError):
@@ -44,6 +43,5 @@ def test_expected_urls_must_be_a_list() -> None:
 
 
 def test_json_round_trip() -> None:
-    # The Golden Set will be stored as JSONL, so each case must survive JSON exactly.
     case = make_case()
     assert EvalCase.model_validate_json(case.model_dump_json()) == case
