@@ -1,0 +1,133 @@
+/*
+ * Cora Knowledge Center look for the Chainlit UI.
+ * Colors come from public/theme.json (CSS variables); this file only covers what
+ * theme variables cannot: the black header, answer cards, links, composer and RTL text.
+ * Loaded via `custom_css = "/public/custom.css"` in .chainlit/config.toml.
+ */
+
+:root {
+  --kc-header-bg: #0a0a0b;
+  --kc-header-fg: #ffffff;
+  --kc-orange: #ffad28;
+  --kc-link: #a35a00; /* darker orange: 5.2:1 contrast on white (#ffad28 is only 1.9:1) */
+  --kc-shadow: 0 2px 8px rgb(0 0 0 / 0.15);
+}
+
+.dark {
+  --kc-header-bg: #0a0a0b;
+  --kc-link: #ffad28; /* orange is readable on dark cards (9:1) */
+  --kc-shadow: 0 2px 8px rgb(0 0 0 / 0.4);
+}
+
+/* ---- Header: black banner with white text/icons ---- */
+#header {
+  background-color: var(--kc-header-bg);
+  color: var(--kc-header-fg);
+  border-bottom: 3px solid var(--kc-orange);
+  height: 64px;
+}
+
+#header button {
+  color: var(--kc-header-fg);
+}
+
+#header button:hover {
+  color: var(--kc-orange);
+  background-color: transparent;
+}
+
+/* Banner title in the middle of the header, like the Knowledge Center site. */
+#header::after {
+  content: "Cora Knowledge Center Assistant";
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 1.35rem;
+  font-weight: 700;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* On narrow screens there is no room between the header buttons; the welcome card shows the name. */
+@media (max-width: 700px) {
+  #header::after {
+    display: none;
+  }
+}
+
+/* Light mode only: hide the light/dark theme toggle (see public/force-light.js). */
+#theme-toggle {
+  display: none;
+}
+
+/* Chainlit's default logo is dark; render it white so it stays visible on black. */
+#header img {
+  filter: brightness(0) invert(1);
+}
+
+/* ---- Assistant answers: white rounded cards with soft shadow ---- */
+.ai-message .message-content {
+  background-color: hsl(var(--card));
+  color: hsl(var(--card-foreground));
+  border-radius: 12px;
+  padding: 16px 20px;
+  box-shadow: var(--kc-shadow);
+}
+
+/* ---- User messages: dark gray rounded bubble with white text (5:1 contrast) ---- */
+/* :not(#message-composer): the composer has the same classes; white text there was invisible. */
+.bg-accent.rounded-3xl:not(#message-composer) {
+  color: hsl(var(--accent-foreground));
+  box-shadow: var(--kc-shadow);
+}
+
+/* ---- Links (e.g. the Sources list) ---- */
+.message-content a {
+  color: var(--kc-link);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.message-content a:hover {
+  text-decoration-thickness: 2px;
+}
+
+.message-content strong {
+  color: hsl(var(--secondary-foreground));
+}
+
+/* ---- Message composer (input box) and send button ---- */
+#message-composer {
+  background-color: hsl(var(--card));
+  border: 1px solid hsl(var(--border));
+  box-shadow: var(--kc-shadow);
+}
+
+#message-composer:focus-within {
+  border-color: var(--kc-orange);
+  box-shadow: 0 0 0 2px var(--kc-orange);
+}
+
+#chat-submit {
+  background-color: var(--kc-orange);
+  color: #0a0a0b;
+}
+
+#chat-submit:hover {
+  filter: brightness(0.95);
+}
+
+/* ---- Hebrew / mixed-direction text ----
+ * `unicode-bidi: plaintext` picks each paragraph's direction from its first strong
+ * character, so a Hebrew message is right-to-left and an English one left-to-right.
+ */
+.message-content p,
+.message-content li,
+.message-content h1,
+.message-content h2,
+.message-content h3,
+#chat-input {
+  unicode-bidi: plaintext;
+  text-align: start;
+}

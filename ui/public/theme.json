@@ -1,0 +1,33 @@
+{
+  "variables": {
+    "light": {
+      "--font-sans": "\"Segoe UI\", \"Open Sans\", system-ui, -apple-system, Arial, sans-serif",
+      "--background": "100 11.1% 78.8%",
+      "--foreground": "213.3 12.7% 13.9%",
+      "--card": "0 0% 100%",
+      "--card-foreground": "213.3 12.7% 13.9%",
+      "--popover": "0 0% 100%",
+      "--popover-foreground": "213.3 12.7% 13.9%",
+      "--primary": "37.1 100% 57.8%",
+      "--primary-foreground": "240 4.8% 4.1%",
+      "--secondary": "97.5 15.4% 89.8%",
+      "--secondary-foreground": "206.2 13.6% 23.1%",
+      "--muted": "97.5 15.4% 89.8%",
+      "--muted-foreground": "142.5 5.1% 30.6%",
+      "--accent": "96 2.3% 42.9%",
+      "--accent-foreground": "0 0% 100%",
+      "--border": "102.9 9% 69.4%",
+      "--input": "102.9 9% 69.4%",
+      "--ring": "37.1 100% 57.8%",
+      "--radius": "0.75rem",
+      "--sidebar-background": "120 2.2% 27.3%",
+      "--sidebar-foreground": "0 0% 100%",
+      "--sidebar-primary": "37.1 100% 57.8%",
+      "--sidebar-primary-foreground": "240 4.8% 4.1%",
+      "--sidebar-accent": "96 2.3% 42.9%",
+      "--sidebar-accent-foreground": "0 0% 100%",
+      "--sidebar-border": "96 2.3% 42.9%",
+      "--sidebar-ring": "37.1 100% 57.8%"
+    }
+  }
+}
