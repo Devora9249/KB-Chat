@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from contracts.retrieval import Filters, SearchResult
 from kc.indexing._provisional_contracts import Chunk, Document
+from kc.indexing.upsert_validation import validate_upsert
 from kc.indexing.vector_math import cosine_similarity
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
@@ -88,18 +89,7 @@ class InMemoryIndexStore:
         self, document: Document, chunks: list[Chunk], vectors: list[list[float]]
     ) -> None:
         # 1. Validate everything before touching the store.
-        if len(chunks) != len(vectors):
-            raise ValueError(f"got {len(chunks)} chunks but {len(vectors)} vectors")
-        for i, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True)):
-            if len(vector) != self._dimension:
-                raise ValueError(
-                    f"vector {i} has dimension {len(vector)}, index dimension is {self._dimension}"
-                )
-            if chunk.document_url != document.url:
-                raise ValueError(
-                    f"chunk {chunk.id!r} has document_url {chunk.document_url!r}, "
-                    f"expected {document.url!r}"
-                )
+        validate_upsert(document, chunks, vectors, self._dimension)
 
         # 2. Build the new entry aside, from copies.
         stored = _StoredDocument(
