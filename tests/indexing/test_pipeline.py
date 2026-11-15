@@ -6,14 +6,8 @@ from typing import Any
 
 import pytest
 
-from kc.indexing._provisional_contracts import (
-    Chunk,
-    Document,
-    Embedder,
-    EmbeddingError,
-    IndexStore,
-    InputType,
-)
+from contracts.storage import Embedder, EmbeddingError, InputType
+from kc.indexing._provisional_contracts import Chunk, Document, IndexStore
 from kc.indexing.fake_embedder import FakeEmbedder
 from kc.indexing.in_memory_index_store import InMemoryIndexStore
 from kc.indexing.pipeline import index_document, index_documents

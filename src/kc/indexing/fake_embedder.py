@@ -20,7 +20,7 @@ import hashlib
 import re
 from typing import get_args
 
-from kc.indexing._provisional_contracts import InputType
+from contracts.storage import InputType
 from kc.indexing.vector_math import normalize
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)

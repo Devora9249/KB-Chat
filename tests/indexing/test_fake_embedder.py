@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from kc.indexing._provisional_contracts import InputType
+from contracts.storage import InputType
 from kc.indexing.fake_embedder import FakeEmbedder
 from kc.indexing.vector_math import cosine_similarity, norm
 
