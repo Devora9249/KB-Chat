@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from kc.indexing._provisional_contracts import Chunk, Document, Filters
+from kc.indexing._provisional_contracts import Chunk, Document
 from kc.indexing.in_memory_index_store import InMemoryIndexStore
 
 
@@ -19,10 +19,6 @@ def test_constructor_validation() -> None:
         InMemoryIndexStore(dimension=3, model_name="")
     store = InMemoryIndexStore(dimension=3, model_name="fake-embedder-v1")
     assert (store.dimension, store.model_name) == (3, "fake-embedder-v1")
-
-
-def test_filters_placeholder_has_no_fields() -> None:
-    assert Filters.model_fields == {}
 
 
 def test_text_search_score_is_number_of_matching_words() -> None:

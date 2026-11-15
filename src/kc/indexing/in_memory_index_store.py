@@ -5,6 +5,7 @@ Storage: dict url -> (Document, [(Chunk, vector), ...]).
 - vector_search: cosine similarity against every stored vector.
 - text_search: a simple stand-in for Postgres full-text search: score = how many times
   query words appear in the chunk text (case-insensitive); chunks with score 0 are left out.
+- Filters (D10) are applied BEFORE ranking, so k counts only matching chunks.
 - Results: score descending, ties broken by chunk_id, at most k.
 
 Atomic replace: upsert_document validates ALL input first, builds the new entry aside,
@@ -39,9 +40,23 @@ def _check_k(k: int) -> None:
         raise ValueError(f"k must be positive, got {k}")
 
 
-def _check_filters(filters: Filters | None) -> None:
-    if filters is not None:
-        raise NotImplementedError("Filters not agreed yet (D10)")
+def _matches(chunk: Chunk, filters: Filters | None) -> bool:
+    """Filters semantics (D10): None field = no filter; OR within a field; AND between
+    fields; exclude_doc_types removes; versions never matches version=None.
+    Validation (empty lists, include/exclude overlap) is done by Filters itself."""
+    if filters is None:
+        return True
+    if filters.products is not None and chunk.product not in filters.products:
+        return False
+    if filters.versions is not None and (
+        chunk.version is None or chunk.version not in filters.versions
+    ):
+        return False
+    if filters.doc_types is not None and chunk.doc_type not in filters.doc_types:
+        return False
+    return not (
+        filters.exclude_doc_types is not None and chunk.doc_type in filters.exclude_doc_types
+    )
 
 
 class InMemoryIndexStore:
@@ -101,15 +116,16 @@ class InMemoryIndexStore:
         self, vector: list[float], filters: Filters | None = None, *, k: int = 10
     ) -> list[SearchResult]:
         _check_k(k)
-        _check_filters(filters)
         if len(vector) != self._dimension:
             raise ValueError(
                 f"query vector has dimension {len(vector)}, index dimension is {self._dimension}"
             )
+        # Filter FIRST, then rank and cut to k: k counts only matching chunks.
         scored = [
             (cosine_similarity(vector, stored_vector), chunk, stored.document)
             for stored in self._documents.values()
             for chunk, stored_vector in stored.entries
+            if _matches(chunk, filters)
         ]
         return self._top_k(scored, k)
 
@@ -117,13 +133,14 @@ class InMemoryIndexStore:
         self, query: str, filters: Filters | None = None, *, k: int = 10
     ) -> list[SearchResult]:
         _check_k(k)
-        _check_filters(filters)
         query_terms = set(_tokens(query))
         if not query_terms:
             return []
         scored = []
         for stored in self._documents.values():
             for chunk, _vector in stored.entries:
+                if not _matches(chunk, filters):
+                    continue
                 score = sum(1 for token in _tokens(chunk.text) if token in query_terms)
                 if score > 0:
                     scored.append((float(score), chunk, stored.document))

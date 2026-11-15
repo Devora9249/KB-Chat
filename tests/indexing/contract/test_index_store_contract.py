@@ -72,15 +72,111 @@ def test_vector_search_rejects_wrong_query_dimension(store: IndexStore) -> None:
         run(store.vector_search([1.0, 0.0]))
 
 
-# --- D10: Filters not agreed yet ------------------------------------------------------------
-# TODO(D10): replace with real filter tests once the Filters fields are confirmed.
+# --- D10: Filters (agreed with Racheli, 2026-11-12) ----------------------------------------
+# Each rule is checked in BOTH searches. Every chunk text contains "saml" and every vector
+# equals the query vector, so without filters every chunk is returned by either search.
+
+SearchKind = str  # "vector" | "text"
+SAME = [1.0, 0.0, 0.0]
 
 
-def test_any_filters_value_raises_not_implemented_in_both_searches(store: IndexStore) -> None:
-    with pytest.raises(NotImplementedError, match=r"Filters not agreed yet \(D10\)"):
-        run(store.vector_search([1.0, 0.0, 0.0], Filters()))
-    with pytest.raises(NotImplementedError, match=r"Filters not agreed yet \(D10\)"):
-        run(store.text_search("query", Filters()))
+def _search_ids(
+    store: IndexStore, kind: SearchKind, filters: Filters | None, k: int = 100
+) -> list[str]:
+    if kind == "vector":
+        results = run(store.vector_search(SAME, filters, k=k))
+    else:
+        results = run(store.text_search("saml", filters, k=k))
+    return sorted(r.chunk_id for r in results)
+
+
+def _index_variety(store: IndexStore) -> None:
+    """seq-howto-9, seq-notes-9, orch-howto-10, cm-howto-none (version=None)."""
+    chunks = [
+        make_chunk("seq-howto-9", "u1", "saml", product="sequence", version="9"),
+        make_chunk(
+            "seq-notes-9", "u1", "saml", product="sequence", version="9", doc_type="release-notes"
+        ),
+        make_chunk("orch-howto-10", "u1", "saml", product="orchestration", version="10"),
+        make_chunk("cm-howto-none", "u1", "saml", product="case-manager", version=None),
+    ]
+    run(store.upsert_document(make_doc("u1"), chunks, [SAME] * len(chunks)))
+
+
+ALL_IDS = ["cm-howto-none", "orch-howto-10", "seq-howto-9", "seq-notes-9"]
+search_kinds = pytest.mark.parametrize("kind", ["vector", "text"])
+
+
+@search_kinds
+def test_no_filters_and_all_none_filters_return_everything(
+    store: IndexStore, kind: SearchKind
+) -> None:
+    _index_variety(store)
+    assert _search_ids(store, kind, None) == ALL_IDS
+    assert _search_ids(store, kind, Filters()) == ALL_IDS
+
+
+@search_kinds
+def test_values_in_one_field_are_or(store: IndexStore, kind: SearchKind) -> None:
+    _index_variety(store)
+    filters = Filters(products=["sequence", "orchestration"])
+    assert _search_ids(store, kind, filters) == ["orch-howto-10", "seq-howto-9", "seq-notes-9"]
+
+
+@search_kinds
+def test_different_fields_are_and(store: IndexStore, kind: SearchKind) -> None:
+    _index_variety(store)
+    filters = Filters(products=["sequence"], doc_types=["how-to"])
+    assert _search_ids(store, kind, filters) == ["seq-howto-9"]
+
+
+@search_kinds
+def test_exclude_doc_types_removes_those_types(store: IndexStore, kind: SearchKind) -> None:
+    _index_variety(store)
+    filters = Filters(exclude_doc_types=["release-notes"])
+    assert _search_ids(store, kind, filters) == ["cm-howto-none", "orch-howto-10", "seq-howto-9"]
+
+
+@search_kinds
+def test_versions_filter_never_returns_chunks_without_version(
+    store: IndexStore, kind: SearchKind
+) -> None:
+    _index_variety(store)
+    # Every versioned chunk is requested; the version=None chunk must still be left out.
+    filters = Filters(versions=["9", "10", "11"])
+    ids = _search_ids(store, kind, filters)
+    assert "cm-howto-none" not in ids
+    assert ids == ["orch-howto-10", "seq-howto-9", "seq-notes-9"]
+
+
+def test_filters_apply_before_k_in_vector_search(store: IndexStore) -> None:
+    # 5 non-matching chunks score HIGHER than all matching ones. A store that took the
+    # top k first and filtered afterwards would return nothing.
+    blockers = [make_chunk(f"x-{i}", "u1", product="orchestration", version="10") for i in range(5)]
+    wanted = [make_chunk(f"s-{i}", "u1", product="sequence") for i in range(8)]
+    blocker_vectors = [[1.0, 0.0, 0.0]] * 5  # cosine 1.0 with the query
+    wanted_vectors = [[1.0, 0.5 + i * 0.5, 0.0] for i in range(8)]  # s-0 best ... s-7 worst
+    run(store.upsert_document(make_doc("u1"), blockers + wanted, blocker_vectors + wanted_vectors))
+
+    results = run(store.vector_search([1.0, 0.0, 0.0], Filters(products=["sequence"]), k=5))
+
+    assert [r.chunk_id for r in results] == ["s-0", "s-1", "s-2", "s-3", "s-4"]
+
+
+def test_filters_apply_before_k_in_text_search(store: IndexStore) -> None:
+    v = [1.0, 0.0, 0.0]
+    blockers = [
+        make_chunk(f"x-{i}", "u1", "saml saml saml saml", product="orchestration") for i in range(5)
+    ]
+    wanted = [
+        make_chunk(f"s-{i}", "u1", " ".join(["saml"] * (3 - min(i, 2))), product="sequence")
+        for i in range(6)
+    ]  # s-0: 3 matches, s-1: 2, s-2..s-5: 1
+    run(store.upsert_document(make_doc("u1"), blockers + wanted, [v] * 11))
+
+    results = run(store.text_search("saml", Filters(products=["sequence"]), k=5))
+
+    assert [r.chunk_id for r in results] == ["s-0", "s-1", "s-2", "s-3", "s-4"]
 
 
 # --- D6: replace all chunks of a document --------------------------------------------------

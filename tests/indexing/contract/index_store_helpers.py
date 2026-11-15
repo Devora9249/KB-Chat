@@ -29,15 +29,23 @@ def make_doc(url: str, *, title: str = "Title", content_hash: str = "h1") -> Doc
     )
 
 
-def make_chunk(chunk_id: str, url: str, text: str = "text") -> Chunk:
+def make_chunk(
+    chunk_id: str,
+    url: str,
+    text: str = "text",
+    *,
+    product: str = "sequence",
+    version: str | None = "9",
+    doc_type: str = "how-to",
+) -> Chunk:
     return Chunk(
         id=chunk_id,
         document_url=url,
         text=text,
         heading_path=["H1"],
-        product="sequence",
-        version="9.x",
-        doc_type="how-to",
+        product=product,
+        version=version,
+        doc_type=doc_type,
     )
 
 
