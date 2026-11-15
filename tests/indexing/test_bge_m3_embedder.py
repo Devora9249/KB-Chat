@@ -6,14 +6,24 @@ load the real BAAI/bge-m3 and run only with KC_REAL_EMBEDDER=1 (see conftest.py)
 
 import asyncio
 import hashlib
+import os
+import sys
 import threading
 import time
-from typing import Any
+import types
+from typing import Any, ClassVar
 
 import pytest
 
 from contracts.storage import Embedder, EmbeddingError, InputType
-from kc.indexing.bge_m3_embedder import DIMENSION, MODEL_NAME, BgeM3Embedder
+from kc.indexing.bge_m3_embedder import (
+    DIMENSION,
+    DISABLE_CONVERSION_ENV_VAR,
+    MODEL_NAME,
+    MODEL_REVISION,
+    BgeM3Embedder,
+    _load_sentence_transformer,
+)
 from kc.indexing.vector_math import cosine_similarity, norm
 
 
@@ -126,6 +136,64 @@ def test_input_type_is_ignored_but_validated() -> None:
 def test_invalid_batch_size_raises() -> None:
     with pytest.raises(ValueError):
         BgeM3Embedder(batch_size=0)
+
+
+# --- loader: pinned revision, no background safetensors conversion ---------------------------
+
+
+class _RecordingSentenceTransformer:
+    """Replaces sentence_transformers.SentenceTransformer; records how it was built."""
+
+    instances: ClassVar[list["_RecordingSentenceTransformer"]] = []
+
+    def __init__(self, model_name_or_path: str, **kwargs: Any) -> None:
+        self.model_name_or_path = model_name_or_path
+        self.kwargs = kwargs
+        # What transformers would see while loading:
+        self.conversion_env = os.environ.get(DISABLE_CONVERSION_ENV_VAR)
+        _RecordingSentenceTransformer.instances.append(self)
+
+
+@pytest.fixture
+def fake_sentence_transformers(monkeypatch: pytest.MonkeyPatch) -> type:
+    module = types.ModuleType("sentence_transformers")
+    module.SentenceTransformer = _RecordingSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+    _RecordingSentenceTransformer.instances.clear()
+    return _RecordingSentenceTransformer
+
+
+def test_loader_uses_pinned_revision_and_disables_background_conversion(
+    fake_sentence_transformers: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(DISABLE_CONVERSION_ENV_VAR, raising=False)
+
+    _load_sentence_transformer("cpu")
+
+    (loaded,) = _RecordingSentenceTransformer.instances
+    assert loaded.model_name_or_path == "BAAI/bge-m3"
+    assert loaded.kwargs == {"revision": MODEL_REVISION, "device": "cpu"}
+    assert MODEL_REVISION == "5617a9f61b028005a4858fdac845db406aefb181"
+    assert loaded.conversion_env == "1"  # set BEFORE transformers loads the weights
+
+
+def test_loader_respects_an_explicit_conversion_setting(
+    fake_sentence_transformers: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DISABLE_CONVERSION_ENV_VAR, "0")
+    _load_sentence_transformer("cpu")
+    assert _RecordingSentenceTransformer.instances[0].conversion_env == "0"
+
+
+def test_default_embedder_loads_through_the_pinned_loader(
+    fake_sentence_transformers: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(DISABLE_CONVERSION_ENV_VAR, raising=False)
+    embedder = BgeM3Embedder(device="cpu")  # no encoder_factory: the real loader path
+    with pytest.raises(AttributeError):  # the recording fake has no encode(); load happened
+        _embed(embedder, ["a"])
+    (loaded,) = _RecordingSentenceTransformer.instances
+    assert loaded.kwargs["revision"] == MODEL_REVISION
 
 
 # --- output validation (model faults -> EmbeddingError) -------------------------------------

@@ -16,6 +16,15 @@ Design
   bge-m3 "no longer requires adding instructions to the queries".
 - Output check: exactly one vector per text, each of length 1024 and unit norm
   (normalize_embeddings=True); anything else is a model fault -> EmbeddingError.
+- Pinned model version: the model is always loaded at MODEL_REVISION, the official BAAI
+  `main` commit, so every machine uses exactly the same weights.
+- No background safetensors conversion: BAAI's `main` only has pytorch_model.bin. After
+  loading it, `transformers` starts a background thread that downloads a converted
+  model.safetensors (~2.1 GB) "for next time", which is never used at a pinned revision.
+  `transformers` has no parameter to turn this off, only the environment variable
+  DISABLE_SAFETENSORS_CONVERSION (read at load time). The loader sets it to "1" right
+  before loading, unless it is already set explicitly; this applies to the whole process,
+  which is intended (no background downloads in production).
 
 Errors (contracts.storage rules)
 - Wrapped in EmbeddingError with `raise ... from e`, ONLY these infrastructure failures:
@@ -30,6 +39,7 @@ Errors (contracts.storage rules)
 
 import asyncio
 import math
+import os
 import threading
 from collections.abc import Callable
 from typing import Any, Protocol, cast, get_args
@@ -37,7 +47,12 @@ from typing import Any, Protocol, cast, get_args
 from contracts.storage import EmbeddingError, InputType
 
 MODEL_NAME = "BAAI/bge-m3"
+# Pinned commit of BAAI/bge-m3 `main` on the Hugging Face Hub (official BAAI weights).
+# Changing it changes the vectors: it REQUIRES a full re-index (coordinate with Chaya).
+MODEL_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 DIMENSION = 1024
+# transformers setting that stops the background safetensors download (see module docstring).
+DISABLE_CONVERSION_ENV_VAR = "DISABLE_SAFETENSORS_CONVERSION"
 _VALID_INPUT_TYPES: tuple[str, ...] = get_args(InputType)
 _NORM_TOLERANCE = 1e-3
 
@@ -60,9 +75,14 @@ EncoderFactory = Callable[[], SentenceEncoder]
 
 
 def _load_sentence_transformer(device: str) -> SentenceEncoder:
+    """Load bge-m3 at the pinned revision, without the background safetensors download."""
+    os.environ.setdefault(DISABLE_CONVERSION_ENV_VAR, "1")  # an explicit setting wins
     from sentence_transformers import SentenceTransformer  # optional extra: import lazily
 
-    return cast(SentenceEncoder, SentenceTransformer(MODEL_NAME, device=device))
+    return cast(
+        SentenceEncoder,
+        SentenceTransformer(MODEL_NAME, revision=MODEL_REVISION, device=device),
+    )
 
 
 class BgeM3Embedder:
