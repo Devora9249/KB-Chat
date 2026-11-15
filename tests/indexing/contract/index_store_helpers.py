@@ -4,7 +4,15 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from kc.indexing._provisional_contracts import Chunk, Document, IndexStore, SearchResult
+from kc.indexing._provisional_contracts import (
+    Chunk,
+    DocType,
+    Document,
+    IndexStore,
+    Product,
+    SearchResult,
+    Version,
+)
 
 # A factory creates a NEW, EMPTY store with the given vector dimension.
 StoreFactory = Callable[[int], IndexStore]
@@ -22,7 +30,7 @@ def make_doc(url: str, *, title: str = "Title", content_hash: str = "h1") -> Doc
         title=title,
         breadcrumb=["Home"],
         product="sequence",
-        version="9.x",
+        version="9",
         doc_type="how-to",
         content_md="...",
         content_hash=content_hash,
@@ -34,15 +42,16 @@ def make_chunk(
     url: str,
     text: str = "text",
     *,
-    product: str = "sequence",
-    version: str | None = "9",
-    doc_type: str = "how-to",
+    product: Product = "sequence",
+    version: Version | None = "9",
+    doc_type: DocType = "how-to",
+    heading_path: list[str] | None = None,
 ) -> Chunk:
     return Chunk(
         id=chunk_id,
         document_url=url,
         text=text,
-        heading_path=["H1"],
+        heading_path=heading_path if heading_path is not None else ["H1"],
         product=product,
         version=version,
         doc_type=doc_type,

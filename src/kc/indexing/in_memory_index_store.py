@@ -156,6 +156,10 @@ class InMemoryIndexStore:
                 title=document.title,
                 text=chunk.text,
                 score=score,
+                product=chunk.product,
+                version=chunk.version,
+                doc_type=chunk.doc_type,
+                heading_path=list(chunk.heading_path),
             )
             for score, chunk, document in scored[:k]
         ]

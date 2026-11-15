@@ -31,7 +31,7 @@ def make_doc(url: str, content_hash: str = "h1") -> Document:
         title=f"Title of {url}",
         breadcrumb=["Home"],
         product="sequence",
-        version="9.x",
+        version="9",
         doc_type="how-to",
         content_md="...",
         content_hash=content_hash,
@@ -45,7 +45,7 @@ def make_chunk(chunk_id: str, url: str, text: str) -> Chunk:
         text=text,
         heading_path=["H1"],
         product="sequence",
-        version="9.x",
+        version="9",
         doc_type="how-to",
     )
 

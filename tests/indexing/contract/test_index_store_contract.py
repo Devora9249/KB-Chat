@@ -45,6 +45,42 @@ def test_vector_search_orders_by_score_and_fills_result_fields(store: IndexStore
     assert top.score > results[1].score
 
 
+@pytest.mark.parametrize("kind", ["vector", "text"])
+def test_search_result_metadata_is_filled_from_the_chunk(store: IndexStore, kind: str) -> None:
+    # contracts.retrieval.SearchResult requires product, version, doc_type, heading_path.
+    chunks = [
+        make_chunk(
+            "a",
+            "u1",
+            "saml",
+            product="orchestration",
+            version="11",
+            doc_type="release-notes",
+            heading_path=["Release Notes", "11.2"],
+        ),
+        make_chunk("b", "u1", "saml", product="case-manager", version=None),
+    ]
+    run(store.upsert_document(make_doc("u1"), chunks, [[1.0, 0.0, 0.0]] * 2))
+
+    if kind == "vector":
+        results = run(store.vector_search([1.0, 0.0, 0.0]))
+    else:
+        results = run(store.text_search("saml"))
+    by_id = {r.chunk_id: r for r in results}
+
+    assert (
+        by_id["a"].product,
+        by_id["a"].version,
+        by_id["a"].doc_type,
+        by_id["a"].heading_path,
+    ) == ("orchestration", "11", "release-notes", ["Release Notes", "11.2"])
+    assert (by_id["b"].product, by_id["b"].version, by_id["b"].doc_type) == (
+        "case-manager",
+        None,
+        "how-to",
+    )
+
+
 def test_ties_are_broken_by_chunk_id(store: IndexStore) -> None:
     same = [1.0, 0.0, 0.0]
     chunks = [make_chunk(cid, "u1") for cid in ["c3", "c1", "c2"]]
