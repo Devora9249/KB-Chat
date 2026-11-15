@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from contracts.storage import Embedder, SearchIndex
     from kc.indexing._provisional_contracts import IndexStore, IndexWriter
+    from kc.indexing.bge_m3_embedder import BgeM3Embedder
     from kc.indexing.fake_embedder import FakeEmbedder
     from kc.indexing.in_memory_index_store import InMemoryIndexStore
 
@@ -18,3 +19,4 @@ if TYPE_CHECKING:
     _as_index_writer: IndexWriter = _store
     _as_index_store: IndexStore = _store
     _as_embedder: Embedder = FakeEmbedder()
+    _bge_as_embedder: Embedder = BgeM3Embedder()
