@@ -29,7 +29,7 @@ import time
 from typing import Any
 
 from kc.indexing.bge_m3_embedder import (
-    MODEL_NAME,
+    MODEL_ID,
     BgeM3Embedder,
     SentenceEncoder,
     _load_sentence_transformer,
@@ -243,7 +243,7 @@ async def run(batch_size: int, chunk_count: int) -> list[tuple[str, str]]:
             f"batch_size {batch_size}",
         ),
     )
-    rows.insert(0, ("Model", MODEL_NAME))
+    rows.insert(0, ("Model", MODEL_ID))
     return rows
 
 

@@ -12,6 +12,9 @@ Design
   anyway). A threading.Lock inside the worker thread also guards the model: if a caller is
   cancelled, the asyncio.Lock is released at once while its thread keeps running until the
   encode finishes; the threading.Lock makes the next call wait for that thread.
+  TODO(micro-batching): collect questions that arrive concurrently and encode them as ONE
+  batch instead of queueing them one by one. Only if measurements under real load show
+  that the queue is a problem (benchmark: 20 concurrent questions -> last answer ~1.5-2.3 s).
 - input_type is accepted (callers MUST pass it) but IGNORED: per the official model card,
   bge-m3 "no longer requires adding instructions to the queries".
 - Output check: exactly one vector per text, each of length 1024 and unit norm
@@ -50,6 +53,10 @@ MODEL_NAME = "BAAI/bge-m3"
 # Pinned commit of BAAI/bge-m3 `main` on the Hugging Face Hub (official BAAI weights).
 # Changing it changes the vectors: it REQUIRES a full re-index (coordinate with Chaya).
 MODEL_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
+# What `model_name` reports: model AND version, e.g. "BAAI/bge-m3@5617a9f". The
+# embedding_config guard and evaluation caches compare this string, so a revision change is
+# caught as a model change. Loading still uses MODEL_NAME and MODEL_REVISION separately.
+MODEL_ID = f"{MODEL_NAME}@{MODEL_REVISION[:7]}"
 DIMENSION = 1024
 # transformers setting that stops the background safetensors download (see module docstring).
 DISABLE_CONVERSION_ENV_VAR = "DISABLE_SAFETENSORS_CONVERSION"
@@ -108,7 +115,8 @@ class BgeM3Embedder:
 
     @property
     def model_name(self) -> str:
-        return MODEL_NAME
+        """Model and pinned version (MODEL_ID); changing it requires a full re-index."""
+        return MODEL_ID
 
     @property
     def dimension(self) -> int:

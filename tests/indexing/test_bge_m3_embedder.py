@@ -19,6 +19,7 @@ from contracts.storage import Embedder, EmbeddingError, InputType
 from kc.indexing.bge_m3_embedder import (
     DIMENSION,
     DISABLE_CONVERSION_ENV_VAR,
+    MODEL_ID,
     MODEL_NAME,
     MODEL_REVISION,
     BgeM3Embedder,
@@ -95,7 +96,19 @@ def _embed(embedder: BgeM3Embedder, texts: list[str], kind: InputType = "documen
 def test_satisfies_embedder_protocol_and_identity() -> None:
     embedder = BgeM3Embedder(encoder_factory=CountingFactory())
     assert isinstance(embedder, Embedder)
-    assert (embedder.model_name, embedder.dimension) == ("BAAI/bge-m3", 1024)
+    assert (embedder.model_name, embedder.dimension) == ("BAAI/bge-m3@5617a9f", 1024)
+
+
+def test_model_name_identifies_model_and_pinned_revision() -> None:
+    # Format "<hub id>@<first 7 chars of the pinned revision>": a revision change must change
+    # model_name, so the embedding_config guard demands a re-index.
+    model_name = BgeM3Embedder(encoder_factory=CountingFactory()).model_name
+    hub_id, _, short_revision = model_name.partition("@")
+    assert hub_id == MODEL_NAME == "BAAI/bge-m3"
+    assert short_revision == MODEL_REVISION[:7]
+    assert len(short_revision) == 7
+    assert MODEL_REVISION.startswith(short_revision)
+    assert model_name == MODEL_ID
 
 
 def test_constructor_does_not_load_and_empty_input_does_not_load() -> None:
@@ -310,7 +323,7 @@ def test_real_model_vectors_have_dimension_1024_and_unit_length(
     for vector in vectors:
         assert len(vector) == DIMENSION
         assert abs(norm(vector) - 1.0) < 1e-3
-    assert bge_m3_embedder.model_name == MODEL_NAME
+    assert bge_m3_embedder.model_name == MODEL_ID
 
 
 @pytest.mark.real_model
