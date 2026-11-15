@@ -8,6 +8,8 @@
 """
 
 import asyncio
+import math
+import random
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -317,12 +319,42 @@ def test_verify_embedding_config_records_then_guards_against_a_model_change() ->
 # --- integration: HNSW index usage and iterative scan --------------------------------------------
 
 
-def _axis(axis: int, nudge: float = 0.0) -> list[float]:
-    """Unit-ish vector pointing along `axis`; `nudge` on another axis keeps vectors distinct."""
+def _axis(axis: int) -> list[float]:
+    """Unit vector along `axis` (for tests that only need SOME valid vector)."""
     vector = [0.0] * EMBEDDING_DIMENSION
     vector[axis] = 1.0
-    vector[2] = nudge
     return vector
+
+
+def _unit(vector: list[float]) -> list[float]:
+    length = math.sqrt(sum(x * x for x in vector))
+    return [x / length for x in vector]
+
+
+def _narrow_filter_vectors() -> tuple[list[float], list[list[float]], list[list[float]]]:
+    """(query, 200 orchestration vectors, 5 sequence vectors), deterministic (fixed seed).
+
+    Realistic, NOT degenerate: every vector is different. Each one is the query plus random
+    noise of a given size (noise components ~ N(0, sigma^2 / dim), so the noise norm is
+    about sigma and cos(vector, query) is about 1 / sqrt(1 + sigma^2)):
+    - orchestration: sigma 0.3 -> cos ~ 0.96 (close to the query, all distinct)
+    - sequence:      sigma 1.3 -> cos ~ 0.61 (clearly farther than ANY orchestration one)
+    So the 40 nearest HNSW candidates are all orchestration (a sequence filter rejects
+    them), while distances are graded like real embeddings and the graph stays connected.
+    Earlier data (200 near-identical vectors plus 5 near-identical ones exactly orthogonal
+    to them) built a degenerate HNSW graph in which seq-0 was unreachable.
+    """
+    rng = random.Random(1234)
+    scale = 1 / math.sqrt(EMBEDDING_DIMENSION)
+    query = _unit([rng.gauss(0, 1) for _ in range(EMBEDDING_DIMENSION)])
+
+    def around(sigma: float) -> list[float]:
+        return _unit([q + rng.gauss(0, sigma * scale) for q in query])
+
+    return query, [around(0.3) for _ in range(200)], [around(1.3) for _ in range(5)]
+
+
+NARROW_QUERY, ORCHESTRATION_VECTORS, SEQUENCE_VECTORS = _narrow_filter_vectors()
 
 
 def _engine_that_must_use_indexes(url: str) -> AsyncEngine:
@@ -367,7 +399,7 @@ async def _plan(connection: AsyncConnection, statement: Any) -> str:
 
 
 async def _load_narrow_filter_data(store: PgIndexStore) -> None:
-    """200 orchestration chunks right next to the query, 5 sequence chunks far away."""
+    """200 orchestration chunks close to NARROW_QUERY, 5 sequence chunks clearly farther."""
     orchestration = [
         Chunk(
             id=f"orch-{i:03d}",
@@ -383,7 +415,7 @@ async def _load_narrow_filter_data(store: PgIndexStore) -> None:
     await store.upsert_document(
         _doc("test://orch").model_copy(update={"product": "orchestration"}),
         orchestration,
-        [_axis(0, nudge=i / 1000) for i in range(200)],
+        ORCHESTRATION_VECTORS,
     )
     sequence = [
         Chunk(
@@ -397,14 +429,20 @@ async def _load_narrow_filter_data(store: PgIndexStore) -> None:
         )
         for i in range(5)
     ]
-    await store.upsert_document(
-        _doc("test://seq"), sequence, [_axis(1, nudge=i / 1000) for i in range(5)]
-    )
+    await store.upsert_document(_doc("test://seq"), sequence, SEQUENCE_VECTORS)
 
 
 async def _truncate(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.execute(text("TRUNCATE documents, chunks"))
+
+
+def _assert_all_five_sequence_chunks_best_first(results: list[tuple[str, float]]) -> None:
+    """k=5 results, every one matching the filter (so: all 5 sequence chunks), best first."""
+    ids = [chunk_id for chunk_id, _ in results]
+    scores = [score for _, score in results]
+    assert sorted(ids) == [f"seq-{i}" for i in range(5)], results
+    assert scores == sorted(scores, reverse=True), results
 
 
 @pytest.mark.integration
@@ -420,7 +458,7 @@ def test_vector_search_query_uses_the_hnsw_index() -> None:
             await _load_narrow_filter_data(PgIndexStore(create_session_factory(engine)))
             async with engine.connect() as connection, connection.begin():
                 await connection.execute(apply_settings_statement(vector_search_settings(5)))
-                return await _plan(connection, build_vector_search_statement(_axis(0), None, 5))
+                return await _plan(connection, build_vector_search_statement(NARROW_QUERY, None, 5))
         finally:
             await _truncate(engine)
             await engine.dispose()
@@ -441,19 +479,19 @@ def test_narrow_filter_returns_k_through_vector_search() -> None:
     url = require_database_url()
     require_test_database(url)
 
-    async def scenario() -> list[str]:
+    async def scenario() -> list[tuple[str, float]]:
         engine = create_async_engine(url, poolclass=NullPool)
         store = PgIndexStore(create_session_factory(engine))
         try:
             await _truncate(engine)
             await _load_narrow_filter_data(store)
-            results = await store.vector_search(_axis(0), Filters(products=["sequence"]), k=5)
-            return [r.chunk_id for r in results]
+            results = await store.vector_search(NARROW_QUERY, Filters(products=["sequence"]), k=5)
+            return [(r.chunk_id, r.score) for r in results]
         finally:
             await _truncate(engine)
             await engine.dispose()
 
-    assert run(scenario()) == [f"seq-{i}" for i in range(5)]
+    _assert_all_five_sequence_chunks_best_first(run(scenario()))
 
 
 @pytest.mark.integration
@@ -467,14 +505,16 @@ def test_iterative_scan_is_what_keeps_k_results_when_hnsw_is_the_only_path() -> 
 
     The 40 HNSW candidates nearest to the query are all orchestration: without iterative
     scan the sequence filter loses results; with vector_search's settings it returns all 5.
+    Checks what the contract promises (k results, all matching, best first), not one exact
+    id order, because HNSW is approximate.
     """
     url = require_database_url()
     require_test_database(url)
     narrow = Filters(products=["sequence"])
-    statement = build_vector_search_statement(_axis(0), narrow, 5)
+    statement = build_vector_search_statement(NARROW_QUERY, narrow, 5)
     without_iterative = {**vector_search_settings(5), "hnsw.iterative_scan": "off"}
 
-    async def scenario() -> tuple[list[str], int, str]:
+    async def scenario() -> tuple[list[tuple[str, float]], int, str]:
         engine = _engine_that_must_use_indexes(url)
         try:
             await _truncate(engine)
@@ -488,7 +528,8 @@ def test_iterative_scan_is_what_keeps_k_results_when_hnsw_is_the_only_path() -> 
                     count_without = len((await connection.execute(statement)).all())
 
                     await connection.execute(apply_settings_statement(vector_search_settings(5)))
-                    with_iterative = [row.id for row in (await connection.execute(statement)).all()]
+                    rows = (await connection.execute(statement)).all()
+                    with_iterative = [(row.id, float(row.score)) for row in rows]
                     plan = await _plan(connection, statement)
                 finally:
                     await transaction.rollback()  # the B-tree index comes back
@@ -501,7 +542,7 @@ def test_iterative_scan_is_what_keeps_k_results_when_hnsw_is_the_only_path() -> 
 
     assert "ix_chunks_embedding_hnsw" in plan, plan  # HNSW really answered the query
     assert count_without < 5, "without iterative_scan the narrow filter should lose results"
-    assert with_iterative == [f"seq-{i}" for i in range(5)]
+    _assert_all_five_sequence_chunks_best_first(with_iterative)
 
 
 @pytest.mark.integration
