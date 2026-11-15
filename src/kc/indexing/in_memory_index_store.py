@@ -1,4 +1,7 @@
-"""In-memory IndexStore for tests and local development (draft storage contract D6-D9).
+"""In-memory IndexStore for tests and local development.
+
+Implements contracts.storage.SearchIndex and the provisional IndexWriter / IndexStore
+(see _protocol_checks.py for the mypy proof).
 
 Storage: dict url -> (Document, [(Chunk, vector), ...]).
 
@@ -14,12 +17,16 @@ Inputs are copied, so later changes by the caller do not leak into the store.
 
 Embedding-model guard: the real PgIndexStore compares model_name/dimension with the
 embedding_config table; here there is no table, so model_name is only kept.
+
+Errors: raises ValueError for invalid input, like every IndexStore. It never raises
+IndexStoreError, because it has no infrastructure (no connection, no database).
 """
 
 import re
 from dataclasses import dataclass
 
-from kc.indexing._provisional_contracts import Chunk, Document, Filters, SearchResult
+from contracts.retrieval import Filters, SearchResult
+from kc.indexing._provisional_contracts import Chunk, Document
 from kc.indexing.vector_math import cosine_similarity
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
