@@ -1,8 +1,7 @@
 import asyncio
-import os
 
 import pytest
-from pydantic import SecretStr
+from db_test_support import require_database_url, require_test_database
 from sqlalchemy import delete
 
 from kc.db.embedding_config import (
@@ -13,7 +12,7 @@ from kc.db.embedding_config import (
 )
 from kc.db.engine import create_engine, create_session_factory
 from kc.db.models import EmbeddingConfig
-from kc.db.settings import DbSettings
+from kc.db.settings import db_settings_from_url
 
 
 def test_empty_database_is_initialized() -> None:
@@ -45,11 +44,13 @@ def test_invalid_input_raises() -> None:
 
 @pytest.mark.integration
 def test_ensure_embedding_config_on_real_database() -> None:
-    """Needs KC_INTEGRATION=1, DATABASE_URL, and migrations applied (alembic upgrade head)."""
+    """DESTRUCTIVE (deletes embedding_config rows): runs only on a database whose name
+    contains "test". Needs migrations applied (CI runs `alembic upgrade head` first)."""
+    url = require_database_url()
+    require_test_database(url)
 
     async def run() -> None:
-        settings = DbSettings(_env_file=None, DATABASE_URL=SecretStr(os.environ["DATABASE_URL"]))  # type: ignore[call-arg]
-        engine = create_engine(settings)
+        engine = create_engine(db_settings_from_url(url))
         factory = create_session_factory(engine)
         try:
             async with factory() as session:

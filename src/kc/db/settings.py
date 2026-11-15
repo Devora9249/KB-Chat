@@ -39,3 +39,8 @@ def load_db_settings() -> DbSettings:
     so the single type-ignore lives here instead of at every call site.
     """
     return DbSettings()  # type: ignore[call-arg]
+
+
+def db_settings_from_url(url: str) -> DbSettings:
+    """Settings for an explicit URL, ignoring `.env` (other fields still use their defaults)."""
+    return DbSettings(_env_file=None, DATABASE_URL=SecretStr(url))  # type: ignore[call-arg]

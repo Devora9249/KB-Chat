@@ -18,16 +18,16 @@ def test_batched_invalid_size_raises() -> None:
 
 
 def test_embed_in_batches_matches_single_call_and_counts_calls() -> None:
-    embedder = FakeEmbedder(dim=32)
+    embedder = FakeEmbedder(dimension=32)
     texts = [f"text number {i}" for i in range(7)]
     calls: list[int] = []
 
     async def counting_embed(batch: list[str]) -> list[list[float]]:
         calls.append(len(batch))
-        return await embedder.embed(batch)
+        return await embedder.embed(batch, input_type="document")
 
     batched_vectors = asyncio.run(embed_in_batches(counting_embed, texts, batch_size=3))
-    single_call = asyncio.run(embedder.embed(texts))
+    single_call = asyncio.run(embedder.embed(texts, input_type="document"))
 
     assert batched_vectors == single_call
     assert calls == [3, 3, 1]
