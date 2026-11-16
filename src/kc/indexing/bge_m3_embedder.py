@@ -38,7 +38,7 @@ __all__ = [
 
 MODEL_NAME = "BAAI/bge-m3"
 # Pinned commit of BAAI/bge-m3 `main` on the Hugging Face Hub (official BAAI weights).
-# Changing it changes the vectors: it REQUIRES a full re-index (coordinate with Chaya).
+# Changing it changes the vectors: it REQUIRES a full re-index (coordinate with Tami).
 MODEL_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 # What `model_name` reports, e.g. "BAAI/bge-m3@5617a9f" (see model_id()).
 MODEL_ID = model_id(MODEL_NAME, MODEL_REVISION)

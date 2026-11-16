@@ -33,7 +33,7 @@ from kc.indexing.sentence_transformer_embedder import (
 
 MODEL_NAME = "intfloat/multilingual-e5-large"
 # Pinned commit of intfloat/multilingual-e5-large `main` on the Hugging Face Hub.
-# Changing it changes the vectors: it REQUIRES a full re-index (coordinate with Chaya).
+# Changing it changes the vectors: it REQUIRES a full re-index (coordinate with Tami).
 MODEL_REVISION = "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3"
 # What `model_name` reports, e.g. "intfloat/multilingual-e5-large@3d7cfbd".
 MODEL_ID = model_id(MODEL_NAME, MODEL_REVISION)

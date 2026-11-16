@@ -1,4 +1,4 @@
-"""How many chunks are longer than a model's max input (for Chaya's quality report).
+"""How many chunks are longer than a model's max input (for Tami's quality report).
 
 A model silently TRUNCATES text that is longer than its max input: the end of the chunk is
 not embedded at all. This counts the chunks affected, with the model's OWN tokenizer
