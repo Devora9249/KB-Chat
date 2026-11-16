@@ -59,6 +59,9 @@ class Embedder(Protocol):
     - EmbeddingError: raised only after the embedder's internal retries have failed.
     - ValueError: invalid input (a bug in the caller); NOT wrapped.
     - asyncio.CancelledError: never wrapped (cancellation must propagate).
+    - Timeouts: internal timeouts of the implementation are wrapped in EmbeddingError. A
+      timeout the caller sets (e.g. asyncio.timeout) cancels the call with CancelledError,
+      which is not wrapped, so it reaches the caller as TimeoutError from its own code.
     - Implementations always raise a single exception, never an ExceptionGroup.
     """
 
@@ -104,6 +107,10 @@ class SearchIndex(Protocol):
       wrapped with `raise IndexStoreError(...) from e`.
     - No retries inside the index: whether to retry is the caller's decision.
     - asyncio.CancelledError: never wrapped (cancellation must propagate).
+    - Timeouts: internal timeouts of the implementation (e.g. connection, pool or
+      statement timeouts) are wrapped in IndexStoreError. A timeout the caller sets (e.g.
+      asyncio.timeout) cancels the call with CancelledError, which is not wrapped, so it
+      reaches the caller as TimeoutError from its own code.
     - Implementations always raise a single exception, never an ExceptionGroup.
     """
 
