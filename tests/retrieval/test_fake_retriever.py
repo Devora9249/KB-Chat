@@ -94,6 +94,20 @@ def test_invalid_k_raises(k: int) -> None:
         _search(FakeRetriever(), "saml", k=k)
 
 
+@pytest.mark.parametrize("k", [True, False, 5.0, "5", None])
+def test_k_wrong_type_raises_type_error(k: Any) -> None:
+    # Contract: a non-int k, including bool, is a TypeError (True is NOT treated as 1).
+    with pytest.raises(TypeError, match="k must be an int"):
+        _search(FakeRetriever(), "saml", k=k)
+
+
+@pytest.mark.parametrize(("k", "error"), [(5.0, TypeError), (True, TypeError), (0, ValueError)])
+def test_k_is_validated_before_the_query(k: Any, error: type[Exception]) -> None:
+    # A query with no tokens returns [] early; an invalid k must still be rejected.
+    with pytest.raises(error):
+        _search(FakeRetriever(), "?!", k=k)
+
+
 def test_results_are_cut_to_k() -> None:
     retriever = FakeRetriever([_item(f"c{i}", "saml") for i in range(5)])
     assert len(_search(retriever, "saml", k=2)) == 2
