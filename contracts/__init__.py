@@ -1,7 +1,7 @@
 """Shared contracts between domains. Changes require approval from all six owners."""
 
 from .common import DocType, Product, Version
-from .retrieval import Filters, Retriever, SearchResult
+from .retrieval import Filters, RetrievalError, Retriever, SearchResult
 from .storage import Embedder, EmbeddingError, IndexStoreError, InputType, SearchIndex
 
 __all__ = [
@@ -12,6 +12,7 @@ __all__ = [
     "IndexStoreError",
     "InputType",
     "Product",
+    "RetrievalError",
     "Retriever",
     "SearchIndex",
     "SearchResult",
