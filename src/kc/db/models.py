@@ -80,6 +80,10 @@ class ChunkRow(Base):
 
     __tablename__ = "chunks"
 
+    # Chunk.id from the Chunker (D12, closed): 16 hex chars,
+    # sha256(url | heading_path | part)[:16]. It already includes the URL, so it is unique
+    # across the whole index. The primary key is only a safety net: a collision or a
+    # Chunker bug fails the upsert (mapped to ValueError) instead of silently overwriting.
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     document_url: Mapped[str] = mapped_column(
         Text, ForeignKey("documents.url", ondelete="CASCADE"), nullable=False
