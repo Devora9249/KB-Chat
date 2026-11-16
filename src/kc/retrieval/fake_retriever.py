@@ -6,8 +6,9 @@ Satisfies the `Retriever` protocol from `contracts.retrieval` structurally (no i
 The default corpus is MOCK DATA ONLY (see `_fake_data.py`): invented content,
 not real Knowledge Center pages.
 
-Scoring mirrors `InMemoryIndexStore.text_search` (Raizy, branch feature/storage-fakes)
-so both fakes behave the same. If that algorithm changes, update this one too:
+Scoring mirrors `InMemoryIndexStore.text_search` (Raizy,
+src/kc/indexing/in_memory_index_store.py) so both fakes behave the same.
+If that algorithm changes, update this one too:
 - tokens: `\\w+` on lowercased text;
 - query terms are a set (a word repeated in the query counts once);
 - score = number of tokens in the item's `text` (not title / heading_path) that are
@@ -65,9 +66,14 @@ class FakeRetriever:
     ) -> list[SearchResult]:
         """Return up to `k` results, best first (see module docstring for scoring).
 
+        `k` must be a positive int (contract): a non-int `k` (including bool) raises
+        TypeError; k < 1 raises ValueError. Checked first, before the query is looked at.
+
         Fake-specific decision (NOT required by the shared contract): a query with no
         word tokens (e.g. "" or "  ?! ") returns []. Same as InMemoryIndexStore.text_search.
         """
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError(f"k must be an int, got {type(k).__name__}")
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
 
