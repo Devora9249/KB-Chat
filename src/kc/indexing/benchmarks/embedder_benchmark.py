@@ -1,8 +1,11 @@
-"""Benchmark BgeM3Embedder on THIS machine (CPU) and print a Markdown table.
+"""Benchmark a local embedder (bge-m3 or multilingual-e5) on THIS machine (CPU).
+
+Prints a Markdown table; the same rows for every model, so results can be compared.
 
 Run (from the repo root):
     uv sync --extra local-embeddings
-    uv run python -m kc.indexing.benchmarks.embedder_benchmark
+    uv run python -m kc.indexing.benchmarks.embedder_benchmark                # bge-m3
+    uv run python -m kc.indexing.benchmarks.embedder_benchmark --model e5
 
 What it measures, in order:
 1. Cold start: `import torch`, `import sentence_transformers`, model load.
@@ -13,9 +16,11 @@ What it measures, in order:
    Calls are queued by the embedder's lock, so the last one waits for all others.
 6. 100 realistic chunks (300-600 tokens, counted with the model's tokenizer):
    total time, time per chunk, peak RAM.
+7. How many of those chunks are longer than the model's max input (token_limits; for e5
+   the "passage: " prefix is counted, as the model sees it). Such chunks are truncated.
 
-The model is loaded exactly as in production (BgeM3Embedder's loader): pinned revision and
-no background safetensors download, so nothing in the background distorts the timings.
+The model is loaded exactly as in production (the embedder's own loader): pinned revision
+and no background safetensors download, so nothing in the background distorts the timings.
 """
 
 import argparse
@@ -26,14 +31,45 @@ import platform
 import statistics
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
-from kc.indexing.bge_m3_embedder import (
-    MODEL_ID,
-    BgeM3Embedder,
+from kc.indexing import bge_m3_embedder, e5_embedder
+from kc.indexing.sentence_transformer_embedder import (
+    EncoderFactory,
     SentenceEncoder,
-    _load_sentence_transformer,
+    SentenceTransformerEmbedder,
 )
+from kc.indexing.token_limits import BGE_M3, E5_LARGE, TokenizerSpec, count_over_limit
+
+
+@dataclass(frozen=True)
+class BenchmarkModel:
+    model_id: str
+    load: Callable[[str], SentenceEncoder]  # device -> encoder (production loader)
+    make_embedder: Callable[[int, EncoderFactory], SentenceTransformerEmbedder]
+    token_spec: TokenizerSpec
+
+
+MODELS: dict[str, BenchmarkModel] = {
+    "bge-m3": BenchmarkModel(
+        model_id=bge_m3_embedder.MODEL_ID,
+        load=bge_m3_embedder._load_sentence_transformer,
+        make_embedder=lambda batch_size, factory: bge_m3_embedder.BgeM3Embedder(
+            batch_size=batch_size, encoder_factory=factory
+        ),
+        token_spec=BGE_M3,
+    ),
+    "e5": BenchmarkModel(
+        model_id=e5_embedder.MODEL_ID,
+        load=e5_embedder._load_sentence_transformer,
+        make_embedder=lambda batch_size, factory: e5_embedder.E5Embedder(
+            batch_size=batch_size, encoder_factory=factory
+        ),
+        token_spec=E5_LARGE,
+    ),
+}
 
 QUESTIONS_HE = [
     "איך מגדירים אימות SAML ב-SeQuence 9?",
@@ -153,7 +189,9 @@ def _make_chunks(tokenizer: Any, count: int) -> tuple[list[str], list[int]]:
     return chunks, lengths
 
 
-async def _concurrent(embedder: BgeM3Embedder, questions: list[str]) -> tuple[float, float]:
+async def _concurrent(
+    embedder: SentenceTransformerEmbedder, questions: list[str]
+) -> tuple[float, float]:
     start = time.perf_counter()
     finished: list[float] = []
 
@@ -168,7 +206,7 @@ async def _concurrent(embedder: BgeM3Embedder, questions: list[str]) -> tuple[fl
 # --- main --------------------------------------------------------------------------------------
 
 
-async def run(batch_size: int, chunk_count: int) -> list[tuple[str, str]]:
+async def run(model: BenchmarkModel, batch_size: int, chunk_count: int) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
     rss_start, _ = rss_mb()
 
@@ -178,7 +216,7 @@ async def run(batch_size: int, chunk_count: int) -> list[tuple[str, str]]:
     rows.append(("import sentence_transformers", f"{t_st:.1f} s"))
 
     start = time.perf_counter()
-    encoder: SentenceEncoder = _load_sentence_transformer("cpu")
+    encoder: SentenceEncoder = model.load("cpu")
     t_load = time.perf_counter() - start
     rss_loaded, _ = rss_mb()
     rows.append(("Model load (from local cache)", f"{t_load:.1f} s"))
@@ -186,7 +224,7 @@ async def run(batch_size: int, chunk_count: int) -> list[tuple[str, str]]:
     if rss_start is not None and rss_loaded is not None:
         rows.append(("RAM before -> after load", f"{rss_start:,.0f} MB -> {rss_loaded:,.0f} MB"))
 
-    embedder = BgeM3Embedder(batch_size=batch_size, encoder_factory=lambda: encoder)
+    embedder = model.make_embedder(batch_size, lambda: encoder)
 
     start = time.perf_counter()
     await embedder.embed([QUESTIONS_EN[0]], input_type="query")
@@ -233,6 +271,19 @@ async def run(batch_size: int, chunk_count: int) -> list[tuple[str, str]]:
         )
         if rss_peak is not None:
             rows.append(("Peak RAM (whole run)", f"{rss_peak:,.0f} MB"))
+        spec = model.token_spec
+        report = count_over_limit(
+            chunks,
+            spec,
+            lambda text: len(tokenizer(text)["input_ids"]),  # special tokens incl.
+        )
+        prefix_note = f', "{spec.document_prefix}" counted' if spec.document_prefix else ""
+        rows.append(
+            (
+                f"Chunks over {spec.max_tokens} tokens (truncated{prefix_note})",
+                f"{report.over_limit} of {report.total} (longest {report.longest} tokens)",
+            )
+        )
 
     rows.insert(
         0,
@@ -243,19 +294,20 @@ async def run(batch_size: int, chunk_count: int) -> list[tuple[str, str]]:
             f"batch_size {batch_size}",
         ),
     )
-    rows.insert(0, ("Model", MODEL_ID))
+    rows.insert(0, ("Model", model.model_id))
     return rows
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    parser.add_argument("--model", choices=sorted(MODELS), default="bge-m3")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--chunks", type=int, default=100)
     args = parser.parse_args()
 
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-    rows = asyncio.run(run(args.batch_size, args.chunks))
+    rows = asyncio.run(run(MODELS[args.model], args.batch_size, args.chunks))
 
     print()
     print("| Measurement | Result |")
