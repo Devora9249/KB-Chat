@@ -68,16 +68,42 @@ class SearchResult(BaseModel):
     heading_path: list[str]
 
 
+class RetrievalError(RuntimeError):
+    """Retrieval failed because of infrastructure, not because of the caller's input.
+
+    Raised by `Retriever.search` on a known infrastructure failure: the embedding
+    provider (EmbeddingError), the index (IndexStoreError) or any timeout (TimeoutError),
+    whether from a dependency or from the retriever's own time budget.
+    The API maps it to "service unavailable" (HTTP 503).
+
+    Implementations raise it with `raise RetrievalError(...) from e`, so the original
+    error stays in `__cause__`. When several infrastructure failures happen together,
+    `__cause__` is an ExceptionGroup holding all of them.
+
+    Never wrapped: programming errors (ValueError, TypeError, ...) and
+    asyncio.CancelledError.
+    """
+
+
 class Retriever(Protocol):
     async def search(
         self, query: str, filters: Filters | None = None, k: int = 5
     ) -> list[SearchResult]:
         """Return up to `k` results, best first.
 
-        - `k` must be >= 1; otherwise raises ValueError.
+        - `k` must be a positive int: a non-int `k` (including bool) raises TypeError;
+          k < 1 raises ValueError.
         - Sorted by `score` descending; results with an equal score are sorted
           by `chunk_id` ascending, so the order is deterministic.
         - Each `chunk_id` appears at most once.
         - May return fewer than `k` results (e.g. when filters are restrictive).
+
+        Errors:
+        - TypeError / ValueError: invalid input (see `k` above); NOT wrapped.
+        - RetrievalError: a known infrastructure failure (EmbeddingError, IndexStoreError,
+          TimeoutError), with the original error(s) in `__cause__` (see RetrievalError).
+        - Any other exception from a dependency (ValueError, TypeError, other bugs)
+          propagates unchanged, even if an infrastructure failure happened at the same time.
+        - asyncio.CancelledError: never wrapped.
         """
         ...

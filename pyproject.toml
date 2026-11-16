@@ -61,7 +61,7 @@ select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]
 python_version = "3.12"
 strict = true
 mypy_path = ["src", "."]
-packages = ["kc", "contracts"]
+packages = ["kc", "contracts", "eval"]
 
 # sentence-transformers is an optional extra, NOT installed in CI; without this mypy fails there.
 [[tool.mypy.overrides]]
