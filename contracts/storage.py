@@ -43,6 +43,10 @@ class Embedder(Protocol):
       any number of texts;
     - never returns partial results.
 
+    `model_name` must identify the model AND its version unambiguously (e.g.
+    "BAAI/bge-m3@5617a9f"), because changing it requires a full re-index; callers that use
+    it as a key for a cache or for the re-index guard can rely on that.
+
     `input_type`: callers MUST pass it (it is required and keyword-only, so mypy catches
     a missing one): "query" when searching, "document" when indexing. An implementation
     MAY ignore it if its model does not distinguish the two (e.g. bge-m3).
@@ -55,6 +59,10 @@ class Embedder(Protocol):
     - EmbeddingError: raised only after the embedder's internal retries have failed.
     - ValueError: invalid input (a bug in the caller); NOT wrapped.
     - asyncio.CancelledError: never wrapped (cancellation must propagate).
+    - Timeouts: internal timeouts of the implementation are wrapped in EmbeddingError. A
+      timeout the caller sets (e.g. asyncio.timeout) cancels the call with CancelledError,
+      which is not wrapped, so it reaches the caller as TimeoutError from its own code.
+    - Implementations always raise a single exception, never an ExceptionGroup.
     """
 
     @property
@@ -87,6 +95,11 @@ class SearchIndex(Protocol):
     (one instance lives for the whole application). A search running while a document is
     being updated sees either its old or its new version, never a mix.
 
+    No consistency guarantee across separate calls: each call on its own sees a complete
+    version of every document, but two calls (e.g. vector_search and text_search in the
+    same request) may see different versions if an update happened between them. Every
+    SearchResult carries its own text and URL, so it stands on its own.
+
     Errors:
     - ValueError: invalid input (a bug in the caller, e.g. k <= 0, wrong vector
       dimension); NOT wrapped.
@@ -94,6 +107,11 @@ class SearchIndex(Protocol):
       wrapped with `raise IndexStoreError(...) from e`.
     - No retries inside the index: whether to retry is the caller's decision.
     - asyncio.CancelledError: never wrapped (cancellation must propagate).
+    - Timeouts: internal timeouts of the implementation (e.g. connection, pool or
+      statement timeouts) are wrapped in IndexStoreError. A timeout the caller sets (e.g.
+      asyncio.timeout) cancels the call with CancelledError, which is not wrapped, so it
+      reaches the caller as TimeoutError from its own code.
+    - Implementations always raise a single exception, never an ExceptionGroup.
     """
 
     async def vector_search(
