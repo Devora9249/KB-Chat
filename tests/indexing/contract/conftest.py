@@ -66,9 +66,10 @@ def make_search_index(make_store: StoreFactory) -> SearchIndexFactory:
 EMBEDDER_IMPLEMENTATIONS: dict[str, Callable[[pytest.FixtureRequest], Embedder]] = {
     "fake": lambda request: FakeEmbedder(dimension=64),
     "bge_m3": lambda request: request.getfixturevalue("bge_m3_embedder"),
+    "e5": lambda request: request.getfixturevalue("e5_embedder"),
 }
 # Run only with KC_REAL_EMBEDDER=1 (marker handled in tests/indexing/conftest.py).
-REAL_MODEL_EMBEDDERS = {"bge_m3"}
+REAL_MODEL_EMBEDDERS = {"bge_m3", "e5"}
 
 
 @pytest.fixture(
