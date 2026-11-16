@@ -61,13 +61,23 @@ def make_search_index(make_store: StoreFactory) -> SearchIndexFactory:
     return factory
 
 
-# TODO(BgeM3Embedder): add "bge_m3" here, marked real_model (runs only with KC_REAL_EMBEDDER=1).
-EMBEDDER_IMPLEMENTATIONS: dict[str, Callable[[], Embedder]] = {
-    "fake": lambda: FakeEmbedder(dimension=64),
+# Each entry gets the pytest request, so real models can reuse the session-wide instance
+# (fixture `bge_m3_embedder` in tests/indexing/conftest.py) instead of loading per test.
+EMBEDDER_IMPLEMENTATIONS: dict[str, Callable[[pytest.FixtureRequest], Embedder]] = {
+    "fake": lambda request: FakeEmbedder(dimension=64),
+    "bge_m3": lambda request: request.getfixturevalue("bge_m3_embedder"),
+    "e5": lambda request: request.getfixturevalue("e5_embedder"),
 }
+# Run only with KC_REAL_EMBEDDER=1 (marker handled in tests/indexing/conftest.py).
+REAL_MODEL_EMBEDDERS = {"bge_m3", "e5"}
 
 
-@pytest.fixture(params=sorted(EMBEDDER_IMPLEMENTATIONS))
+@pytest.fixture(
+    params=[
+        pytest.param(name, marks=pytest.mark.real_model) if name in REAL_MODEL_EMBEDDERS else name
+        for name in sorted(EMBEDDER_IMPLEMENTATIONS)
+    ]
+)
 def embedder(request: pytest.FixtureRequest) -> Embedder:
-    """A fresh embedder of the current implementation."""
-    return EMBEDDER_IMPLEMENTATIONS[request.param]()
+    """An embedder of the current implementation."""
+    return EMBEDDER_IMPLEMENTATIONS[request.param](request)

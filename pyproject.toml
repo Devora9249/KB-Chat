@@ -15,6 +15,15 @@ dependencies = [
     "uvicorn>=0.54.0",
 ]
 
+[project.optional-dependencies]
+# Local (free, offline-capable) embedding models: bge-m3, multilingual-e5.
+# Heavy (torch); NOT installed by a plain `uv sync`, so CI stays fast.
+# Install with: uv sync --extra local-embeddings
+local-embeddings = [
+    "sentence-transformers>=3.0",
+    "torch>=2.6",
+]
+
 [dependency-groups]
 dev = [
     "ruff>=0.6",
@@ -30,6 +39,16 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/kc", "contracts"]
 
+# torch from the CPU-only PyTorch index (PyPI's Linux wheels pull several GB of CUDA).
+# `explicit = true`: this index is used ONLY for packages mapped to it below.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
@@ -43,6 +62,11 @@ python_version = "3.12"
 strict = true
 mypy_path = ["src", "."]
 packages = ["kc", "contracts", "eval"]
+
+# sentence-transformers is an optional extra, NOT installed in CI; without this mypy fails there.
+[[tool.mypy.overrides]]
+module = ["sentence_transformers", "sentence_transformers.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
