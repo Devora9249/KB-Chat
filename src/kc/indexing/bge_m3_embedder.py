@@ -32,8 +32,13 @@ Design
 Errors (contracts.storage rules)
 - Wrapped in EmbeddingError with `raise ... from e`, ONLY these infrastructure failures:
   loading: ImportError (extra not installed), OSError (download / Hugging Face Hub
-  errors, which all subclass OSError), MemoryError, RuntimeError (torch);
+  errors and TimeoutError, which all subclass OSError), the HTTP client's TransportError
+  (httpx2 / httpx timeouts and network errors, which do NOT subclass OSError and which the
+  Hub re-raises after its download retries), MemoryError, RuntimeError (torch);
   encoding: RuntimeError (torch, incl. out-of-memory), MemoryError.
+- Internal timeouts are therefore always EmbeddingError. A timeout the CALLER sets (e.g.
+  asyncio.timeout) cancels the call with CancelledError, which is never caught here, so
+  the caller gets TimeoutError from its own code.
 - ValueError for invalid input (bad input_type) is raised as is.
 - No retries here: loading from the local cache does not need them, and a failed download
   is reported to the caller.
@@ -41,6 +46,7 @@ Errors (contracts.storage rules)
 """
 
 import asyncio
+import importlib
 import math
 import os
 import threading
@@ -165,6 +171,13 @@ class BgeM3Embedder:
     def _load_if_needed(self) -> SentenceEncoder:
         """Called with _thread_lock held, so the model is loaded at most once."""
         if self._encoder is None:
+            # OSError also covers TimeoutError and the Hub's own errors.
+            load_errors: tuple[type[BaseException], ...] = (
+                OSError,
+                MemoryError,
+                RuntimeError,
+                *_network_errors(),
+            )
             try:
                 self._encoder = self._encoder_factory()
             except ImportError as e:
@@ -172,9 +185,33 @@ class BgeM3Embedder:
                     f"{MODEL_NAME}: sentence-transformers is not installed; "
                     "run `uv sync --extra local-embeddings`"
                 ) from e
-            except (OSError, MemoryError, RuntimeError) as e:
+            except load_errors as e:
                 raise EmbeddingError(f"{MODEL_NAME}: loading the model failed") from e
         return self._encoder
+
+
+# HTTP clients huggingface_hub may use to download the model. Their timeout and network
+# errors (e.g. ConnectTimeout, ReadTimeout, ConnectError) do NOT subclass OSError, and the
+# Hub re-raises them unchanged once its download retries are exhausted.
+_HTTP_CLIENT_MODULES = ("httpx2", "httpx")
+
+
+def _network_errors() -> tuple[type[BaseException], ...]:
+    """TransportError of each installed HTTP client (covers every timeout/network error).
+
+    Looked up at load time, not imported at module level: these packages only come with
+    the optional local-embeddings extra.
+    """
+    errors: list[type[BaseException]] = []
+    for module_name in _HTTP_CLIENT_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        transport_error = getattr(module, "TransportError", None)
+        if isinstance(transport_error, type) and issubclass(transport_error, BaseException):
+            errors.append(transport_error)
+    return tuple(errors)
 
 
 def _validated(raw: Any, *, expected_count: int) -> list[list[float]]:

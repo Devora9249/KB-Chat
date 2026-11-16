@@ -242,6 +242,68 @@ def test_loading_failures_are_wrapped_with_cause(error: BaseException) -> None:
     assert exc_info.value.__cause__ is error
 
 
+# --- timeouts --------------------------------------------------------------------------------
+
+
+def test_load_timeouts_are_wrapped_but_cancellation_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 1. Python's own TimeoutError (a subclass of OSError).
+    timeout = TimeoutError("model download timed out")
+    with pytest.raises(EmbeddingError) as exc_info:
+        _embed(BgeM3Embedder(encoder_factory=CountingFactory(error=timeout)), ["a"])
+    assert exc_info.value.__cause__ is timeout
+
+    # 2. The HTTP client's timeout (NOT an OSError), as huggingface_hub re-raises it after its
+    #    retries. A fake httpx2 module keeps this test runnable where the extra is missing (CI).
+    fake_httpx2 = types.ModuleType("httpx2")
+
+    class TransportError(Exception):
+        pass
+
+    class ConnectTimeout(TransportError):
+        pass
+
+    fake_httpx2.TransportError = TransportError  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "httpx2", fake_httpx2)
+    client_timeout = ConnectTimeout("connect timed out")
+    assert not isinstance(client_timeout, OSError)
+    with pytest.raises(EmbeddingError) as exc_info:
+        _embed(BgeM3Embedder(encoder_factory=CountingFactory(error=client_timeout)), ["a"])
+    assert exc_info.value.__cause__ is client_timeout
+
+    # 3. Cancellation is never wrapped.
+    cancelled = BgeM3Embedder(encoder_factory=CountingFactory(error=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        _embed(cancelled, ["a"])
+
+
+def test_real_httpx2_timeouts_are_wrapped() -> None:
+    httpx2 = pytest.importorskip("httpx2", reason="needs the local-embeddings extra")
+    for error in (httpx2.ConnectTimeout("connect"), httpx2.ReadTimeout("read")):
+        with pytest.raises(EmbeddingError) as exc_info:
+            _embed(BgeM3Embedder(encoder_factory=CountingFactory(error=error)), ["a"])
+        assert exc_info.value.__cause__ is error
+
+
+def test_caller_timeout_surfaces_as_timeout_error_not_embedding_error() -> None:
+    # A timeout the CALLER sets cancels embed() with CancelledError (never wrapped), so the
+    # caller sees TimeoutError from its own `asyncio.timeout`, not EmbeddingError.
+    release = threading.Event()
+    embedder = BgeM3Embedder(encoder_factory=CountingFactory(FakeEncoder(block=release)))
+
+    async def scenario() -> None:
+        try:
+            async with asyncio.timeout(0.05):
+                await embedder.embed(["slow"], input_type="query")
+        finally:
+            release.set()  # let the worker thread finish
+
+    with pytest.raises(TimeoutError) as exc_info:
+        asyncio.run(scenario())
+    assert not isinstance(exc_info.value, EmbeddingError)
+
+
 @pytest.mark.parametrize(
     "error", [RuntimeError("torch failed"), MemoryError()], ids=["RuntimeError", "MemoryError"]
 )
