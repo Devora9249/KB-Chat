@@ -5,7 +5,7 @@
 *                   @Devora9249
 
 # Contracts: change requires approval from all six
-/contracts/         @Devora9249 <raizy-github> <racheli-github> <leah-github> <chani-github> <chaya-github>
+/contracts/         @Devora9249 @r8283 @RachelyT2 @leah-git1 @ChaniShulevits @TamiShaks-2
 
 # Ingestion — Devora
 /src/kc/ingestion/  @Devora9249
@@ -13,27 +13,27 @@
 /tests/ingestion/   @Devora9249
 
 # Storage & Indexing — Raizy
-/src/kc/db/         <raizy-github>
-/src/kc/indexing/   <raizy-github>
-/tests/db/          <raizy-github>
-/tests/indexing/    <raizy-github>
+/src/kc/db/         @r8283
+/src/kc/indexing/   @r8283
+/tests/db/          @r8283
+/tests/indexing/    @r8283
 
 # Search & Ranking — Racheli
-/src/kc/retrieval/  <racheli-github>
-/tests/retrieval/   <racheli-github>
+/src/kc/retrieval/  @RachelyT2
+/tests/retrieval/   @RachelyT2
 
 # Generation, Agent & API — Leah
-/src/kc/generation/ <leah-github>
-/src/kc/agent/      <leah-github>
-/src/kc/api/        <leah-github>
-/tests/generation/  <leah-github>
-/tests/agent/       <leah-github>
-/tests/api/         <leah-github>
+/src/kc/generation/ @leah-git1
+/src/kc/agent/      @leah-git1
+/src/kc/api/        @leah-git1
+/tests/generation/  @leah-git1
+/tests/agent/       @leah-git1
+/tests/api/         @leah-git1
 
 # Platform & UI — Chani
-/ui/                <chani-github>
-/infra/             <chani-github>
-/.github/workflows/ <chani-github>
+/ui/                @ChaniShulevits
+/infra/             @ChaniShulevits
+/.github/workflows/ @ChaniShulevits
 
-# Evaluation & Quality — Chaya
-/eval/              <chaya-github>
+# Evaluation & Quality — Tami
+/eval/              @TamiShaks-2
