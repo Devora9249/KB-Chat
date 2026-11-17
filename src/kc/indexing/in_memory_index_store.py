@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from contracts.retrieval import Filters, SearchResult
 from kc.indexing._provisional_contracts import Chunk, Document
+from kc.indexing.upsert_validation import validate_upsert
 from kc.indexing.vector_math import cosine_similarity
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
@@ -88,18 +89,22 @@ class InMemoryIndexStore:
         self, document: Document, chunks: list[Chunk], vectors: list[list[float]]
     ) -> None:
         # 1. Validate everything before touching the store.
-        if len(chunks) != len(vectors):
-            raise ValueError(f"got {len(chunks)} chunks but {len(vectors)} vectors")
-        for i, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True)):
-            if len(vector) != self._dimension:
-                raise ValueError(
-                    f"vector {i} has dimension {len(vector)}, index dimension is {self._dimension}"
-                )
-            if chunk.document_url != document.url:
-                raise ValueError(
-                    f"chunk {chunk.id!r} has document_url {chunk.document_url!r}, "
-                    f"expected {document.url!r}"
-                )
+        validate_upsert(document, chunks, vectors, self._dimension)
+        # chunk.id is unique across the whole index (D12): no other document may own one of
+        # these ids (Postgres enforces the same with the chunks primary key).
+        new_ids = {chunk.id for chunk in chunks}
+        taken = sorted(
+            chunk.id
+            for url, entry in self._documents.items()
+            if url != document.url
+            for chunk, _vector in entry.entries
+            if chunk.id in new_ids
+        )
+        if taken:
+            raise ValueError(
+                f"chunk ids already used by another document: {taken} "
+                "(chunk.id must be unique across the whole index, D12)"
+            )
 
         # 2. Build the new entry aside, from copies.
         stored = _StoredDocument(

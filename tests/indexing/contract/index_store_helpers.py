@@ -2,12 +2,12 @@
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from contracts.common import DocType, Product, Version
-from contracts.retrieval import SearchResult
 from contracts.storage import SearchIndex
-from kc.indexing._provisional_contracts import Chunk, Document, IndexStore
+from kc.indexing._provisional_contracts import Chunk, Document, IndexStore, IndexWriter
 
 DIM = 3
 
@@ -25,7 +25,29 @@ class SearchIndexFactory(Protocol):
 
 
 def run[T](coro: Coroutine[Any, Any, T]) -> T:
-    return asyncio.run(coro)
+    # Selector loop: psycopg async (PgIndexStore) does not support Windows' default Proactor
+    # loop; on Linux this is the default loop anyway.
+    return asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)
+
+
+# What a writer actually stored, read back WITHOUT the search side:
+# (chunk id, document_url, text, vector).
+StoredChunk = tuple[str, str, str, tuple[float, ...]]
+
+
+@dataclass
+class WriterUnderTest:
+    """An IndexWriter plus an observer that reads back what it stored (sorted by id)."""
+
+    writer: IndexWriter
+    dimension: int
+    stored: Callable[[], list[StoredChunk]]
+
+    def unit(self, axis: int = 0) -> list[float]:
+        """A unit vector of this writer's dimension (1.0 at `axis`)."""
+        vector = [0.0] * self.dimension
+        vector[axis] = 1.0
+        return vector
 
 
 def make_doc(url: str, *, title: str = "Title", content_hash: str = "h1") -> Document:
@@ -62,6 +84,6 @@ def make_chunk(
     )
 
 
-def snapshot(store: IndexStore) -> tuple[dict[str, str], list[SearchResult]]:
-    """Everything observable from outside: hashes + all chunks via a broad search."""
-    return run(store.get_document_hashes()), run(store.vector_search([1.0, 0.0, 0.0], k=1000))
+def snapshot(w: WriterUnderTest) -> tuple[dict[str, str], list[StoredChunk]]:
+    """Everything a writer stored: document hashes + every chunk with its vector."""
+    return run(w.writer.get_document_hashes()), w.stored()

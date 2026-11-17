@@ -62,6 +62,10 @@ class IndexWriter(Protocol):
       disappeared on re-crawl are removed) and keeps title / content_hash. Raises
       ValueError if len(chunks) != len(vectors), if a vector has the wrong dimension, or if
       a chunk's document_url != document.url; on ValueError nothing is changed.
+    - chunk.id must be unique across the WHOLE index (D12): Search & Ranking fuses results
+      by chunk_id. A duplicate id inside one call, or an id already used by a chunk of
+      ANOTHER document, is a data error -> ValueError, and nothing is changed. Re-upserting
+      a document with its own existing ids is allowed (that is a normal update).
     - delete_document is a no-op if the document does not exist.
     - get_document_hashes returns url -> content_hash of everything indexed.
 

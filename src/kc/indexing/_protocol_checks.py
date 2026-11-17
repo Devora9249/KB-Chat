@@ -8,7 +8,10 @@ signature, wrong return type), `uv run mypy` fails.
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
     from contracts.storage import Embedder, SearchIndex
+    from kc.db.pg_index_store import PgIndexStore
     from kc.indexing._provisional_contracts import IndexStore, IndexWriter
     from kc.indexing.fake_embedder import FakeEmbedder
     from kc.indexing.in_memory_index_store import InMemoryIndexStore
@@ -18,3 +21,8 @@ if TYPE_CHECKING:
     _as_index_writer: IndexWriter = _store
     _as_index_store: IndexStore = _store
     _as_embedder: Embedder = FakeEmbedder()
+
+    _pg = PgIndexStore(async_sessionmaker[AsyncSession]())
+    _pg_as_search_index: SearchIndex = _pg
+    _pg_as_index_writer: IndexWriter = _pg
+    _pg_as_index_store: IndexStore = _pg

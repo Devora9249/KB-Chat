@@ -28,9 +28,9 @@ def _offline_sql(monkeypatch: pytest.MonkeyPatch, *, upgrade: bool) -> str:
 
 def test_single_linear_history() -> None:
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == ["0002"]
+    assert script.get_heads() == ["0004"]
     revisions = [rev.revision for rev in script.walk_revisions("base", "heads")]
-    assert revisions == ["0002", "0001"]
+    assert revisions == ["0004", "0003", "0002", "0001"]
 
 
 def test_upgrade_sql_enables_pgvector_then_creates_embedding_config(
