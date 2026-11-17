@@ -407,3 +407,112 @@ def test_identical_content_in_two_documents_is_not_merged() -> None:
         float(Fraction(2, _RRF_K + 1)),  # rank 1 in both lists
         float(Fraction(2, _RRF_K + 2)),  # rank 2 in both lists
     ]
+
+
+# === Test 38: document lifecycle (update / delete) ========================================
+#
+# A document is identified by its url: seed_index -> index_document -> upsert_document
+# replaces ALL chunks (and their vectors) of that url at once; delete_document removes
+# them. HybridRetriever keeps no cache, so the SAME instance sees every change.
+#
+# Two consequences for the assertions:
+# - chunk ids are sha256(url | heading_path | part), so after an update part 0 keeps its
+#   id: old vs new content is told apart by TEXT, plus the id of a removed part;
+# - vector_search returns every stored chunk, so a query for an old word can still return
+#   the document's NEW chunk: "old content is gone" is checked on texts and ids, not url.
+
+LIFECYCLE_URL = KC_HELP + "zephyr-token-setup"
+OTHER_URL = KC_HELP + "ldap-sync-guide"
+OLD_WORD = "zephyrtoken"
+NEW_WORD = "quasartoken"
+OTHER_WORD = "ldapsync"
+
+
+def _lifecycle_doc(texts: list[str]) -> SampleDocument:
+    return sample_document(
+        LIFECYCLE_URL, "Token Setup", texts, product="sequence", version="9", doc_type="how-to"
+    )
+
+
+OLD_DOC = _lifecycle_doc([f"Legacy {OLD_WORD} setup steps.", f"{OLD_WORD} troubleshooting."])
+NEW_DOC = _lifecycle_doc([f"Updated {NEW_WORD} setup steps."])  # same url, one chunk only
+OTHER_DOC = sample_document(
+    OTHER_URL,
+    "LDAP Sync",
+    [f"Configure {OTHER_WORD} for user accounts."],
+    product="orchestration",
+    version="10",
+    doc_type="how-to",
+)
+
+
+def _find(retriever: HybridRetriever, query: str) -> list[SearchResult]:
+    return asyncio.run(retriever.search(query, k=10))
+
+
+def _texts(results: list[SearchResult]) -> str:
+    return " ".join(r.text for r in results).lower()
+
+
+def test_initial_upsert_is_searchable() -> None:
+    embedder, store, retriever = _components()
+    asyncio.run(seed_index(store, embedder, [OLD_DOC]))
+
+    results = _find(retriever, OLD_WORD)
+
+    assert {r.chunk_id for r in results} == set(OLD_DOC.chunk_ids)
+    assert {r.url for r in results} == {LIFECYCLE_URL}
+    assert OLD_WORD in _texts(results)
+
+
+def test_repeated_upsert_replaces_old_content() -> None:
+    embedder, store, retriever = _components()
+    asyncio.run(seed_index(store, embedder, [OLD_DOC]))
+    assert OLD_WORD in _texts(_find(retriever, OLD_WORD))  # old content searchable first
+
+    # Same url = same document. Part 0 keeps its id; part 1 no longer exists.
+    assert NEW_DOC.url == OLD_DOC.url
+    assert NEW_DOC.chunk_ids[0] == OLD_DOC.chunk_ids[0]
+    removed_id = OLD_DOC.chunk_ids[1]
+    asyncio.run(seed_index(store, embedder, [NEW_DOC]))
+
+    new_results = _find(retriever, NEW_WORD)
+    assert {r.chunk_id for r in new_results} == set(NEW_DOC.chunk_ids)
+    assert {r.url for r in new_results} == {LIFECYCLE_URL}
+    assert NEW_WORD in _texts(new_results)
+
+    old_results = _find(retriever, OLD_WORD)
+    assert OLD_WORD not in _texts(old_results)  # neither the text nor the vector survived
+    assert removed_id not in {r.chunk_id for r in old_results}
+    assert {r.chunk_id for r in old_results} <= set(NEW_DOC.chunk_ids)
+
+
+def test_delete_removes_the_document_from_later_searches() -> None:
+    embedder, store, retriever = _components()
+    asyncio.run(seed_index(store, embedder, [OLD_DOC]))
+    assert {r.url for r in _find(retriever, OLD_WORD)} == {LIFECYCLE_URL}
+
+    asyncio.run(store.delete_document(LIFECYCLE_URL))
+
+    # It was the only document: both searches are now empty.
+    assert _find(retriever, OLD_WORD) == []
+
+
+def test_other_documents_survive_update_and_delete() -> None:
+    embedder, store, retriever = _components()
+    asyncio.run(seed_index(store, embedder, [OLD_DOC, OTHER_DOC]))
+
+    def assert_other_is_found() -> None:
+        results = _find(retriever, OTHER_WORD)
+        assert set(OTHER_DOC.chunk_ids) <= {r.chunk_id for r in results}
+        assert OTHER_WORD in _texts(results)
+
+    assert_other_is_found()
+
+    asyncio.run(seed_index(store, embedder, [NEW_DOC]))  # update the lifecycle document
+    assert_other_is_found()
+
+    asyncio.run(store.delete_document(LIFECYCLE_URL))  # delete the lifecycle document
+    assert_other_is_found()
+    remaining = _find(retriever, f"{OLD_WORD} {NEW_WORD} {OTHER_WORD}")
+    assert {r.url for r in remaining} == {OTHER_URL}
