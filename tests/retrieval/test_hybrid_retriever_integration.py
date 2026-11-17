@@ -1,13 +1,17 @@
 """Integration (Test 37): HybridRetriever + real FakeEmbedder + InMemoryIndexStore.
 
 Step 1: wiring, end-to-end search, empty index. Step 2: filters (product, version).
+Step 3: RRF fusion of the REAL index rankings.
 
 No mocks or stubs: documents are built and loaded only through Raizy's public test helper
 (kc.indexing.testing). Offline: no database, no network, no API key.
 """
 
 import asyncio
+from fractions import Fraction
 from typing import Any
+
+import pytest
 
 from contracts.common import Product, Version
 from contracts.retrieval import Filters, Retriever, SearchResult
@@ -15,6 +19,7 @@ from kc.indexing.fake_embedder import FakeEmbedder
 from kc.indexing.in_memory_index_store import InMemoryIndexStore
 from kc.indexing.testing import SampleDocument, sample_document, seed_index
 from kc.retrieval.hybrid_retriever import _RRF_K, HybridRetriever
+from kc.retrieval.rrf import reciprocal_rank_fusion
 from kc.retrieval.settings import RetrievalSettings, create_hybrid_retriever
 
 DIM = 64
@@ -247,3 +252,158 @@ def test_filter_is_applied_before_choosing_candidates() -> None:
     results = asyncio.run(retriever.search(query, Filters(products=["sequence"]), k=1))
 
     _assert_only(results, allowed)
+
+
+# === Step 3: RRF on the real index rankings ===============================================
+#
+# Tests 1-3 compare HybridRetriever with the two lists that the SAME store returns when it
+# is called directly with the same query, filters and n = max(candidate_k, k).
+
+RRF_QUERY = "configure saml authentication"
+RRF_CANDIDATE_K = 3  # smaller than the corpus, so both lists are really cut to n
+
+
+def _rrf_doc(
+    slug: str, texts: list[str], product: Product, version: Version | None
+) -> SampleDocument:
+    return sample_document(
+        KC_HELP + slug, slug, texts, product=product, version=version, doc_type="how-to"
+    )
+
+
+# 6 chunks in 5 documents; the query words appear in different amounts in each chunk.
+RRF_CORPUS = [
+    _rrf_doc(
+        "saml-setup-sequence",
+        [
+            "Configure SAML authentication for the portal.",
+            "SAML certificates must be renewed every year.",
+        ],
+        "sequence",
+        "9",
+    ),
+    _rrf_doc("saml-orchestration", ["Configure SAML single sign-on."], "orchestration", "10"),
+    _rrf_doc("ldap-sequence", ["Configure LDAP user synchronization."], "sequence", "9"),
+    _rrf_doc("saml-redirect-fix", ["Fixed a SAML login redirect."], "sequence", "8"),
+    _rrf_doc("expression-functions", ["Expression samples for strings."], "orchestration", "11"),
+]
+RRF_CHUNK_COUNT = sum(len(doc.chunk_ids) for doc in RRF_CORPUS)
+
+RRF_CASES = [
+    pytest.param(RRF_QUERY, None, 2, id="no-filter-k2"),
+    pytest.param(RRF_QUERY, None, 5, id="no-filter-k5"),
+    pytest.param(RRF_QUERY, Filters(products=["sequence"]), 3, id="sequence-k3"),
+    pytest.param("saml", Filters(versions=["9", "10"]), 4, id="saml-versions-k4"),
+]
+
+
+def _direct_lists(
+    embedder: FakeEmbedder,
+    store: InMemoryIndexStore,
+    query: str,
+    filters: Filters | None,
+    n: int,
+) -> tuple[list[SearchResult], list[SearchResult]]:
+    """The two candidate lists, straight from the index (same calls HybridRetriever makes)."""
+    (vector,) = asyncio.run(embedder.embed([query], input_type="query"))
+    vector_list = asyncio.run(store.vector_search(vector, filters, k=n))
+    text_list = asyncio.run(store.text_search(query, filters, k=n))
+    return vector_list, text_list
+
+
+# --- 1. HybridRetriever == RRF of the real lists ------------------------------------------
+
+
+@pytest.mark.parametrize(("query", "filters", "k"), RRF_CASES)
+def test_search_equals_rrf_of_the_real_index_lists(
+    query: str, filters: Filters | None, k: int
+) -> None:
+    embedder, store, retriever = _seeded_with(RRF_CORPUS, candidate_k=RRF_CANDIDATE_K)
+    n = max(RRF_CANDIDATE_K, k)
+    vector_list, text_list = _direct_lists(embedder, store, query, filters, n)
+    assert vector_list and text_list  # both branches really contribute
+
+    results = asyncio.run(retriever.search(query, filters, k=k))
+
+    assert results == reciprocal_rank_fusion(vector_list, text_list, rrf_k=_RRF_K)[:k]
+
+
+# --- 2. scores computed by hand from the real ranks ---------------------------------------
+
+
+@pytest.mark.parametrize(("query", "filters", "k"), RRF_CASES)
+def test_scores_are_exact_rrf_sums_of_real_ranks(
+    query: str, filters: Filters | None, k: int
+) -> None:
+    embedder, store, retriever = _seeded_with(RRF_CORPUS, candidate_k=RRF_CANDIDATE_K)
+    n = max(RRF_CANDIDATE_K, k)
+    vector_list, text_list = _direct_lists(embedder, store, query, filters, n)
+
+    # Independent of rrf.py: sum 1 / (_RRF_K + rank) over the lists, rank starting at 1.
+    expected: dict[str, Fraction] = {}
+    for ranked in (vector_list, text_list):
+        ids = [r.chunk_id for r in ranked]
+        assert len(ids) == len(set(ids))  # the index returns each chunk once
+        for rank, chunk_id in enumerate(ids, start=1):
+            expected[chunk_id] = expected.get(chunk_id, Fraction(0)) + Fraction(1, _RRF_K + rank)
+    # Our ordering rule: score descending, ties by chunk_id; then the first k.
+    expected_ids = sorted(expected, key=lambda chunk_id: (-expected[chunk_id], chunk_id))[:k]
+
+    results = asyncio.run(retriever.search(query, filters, k=k))
+
+    assert [r.chunk_id for r in results] == expected_ids
+    for r in results:
+        assert r.score == float(expected[r.chunk_id])
+
+
+# --- 3. the candidate pool is max(candidate_k, k) ------------------------------------------
+
+
+def test_candidate_pool_is_max_of_candidate_k_and_k() -> None:
+    candidate_k = 2
+    embedder, store, retriever = _seeded_with(RRF_CORPUS, candidate_k=candidate_k)
+
+    # Precondition: without a filter vector_search returns every chunk, so the corpus
+    # (6 chunks) can fill k=5 once each list asks for n = max(2, 5) = 5 candidates.
+    all_vector, _ = _direct_lists(embedder, store, RRF_QUERY, None, n=100)
+    assert len(all_vector) == RRF_CHUNK_COUNT >= 5
+    # With only candidate_k=2 per list the pool could never reach 5 results.
+    top2_vector, top2_text = _direct_lists(embedder, store, RRF_QUERY, None, n=candidate_k)
+    pool_of_two = {r.chunk_id for r in top2_vector} | {r.chunk_id for r in top2_text}
+    assert len(pool_of_two) < 5
+
+    # k > candidate_k: the pool grows to k.
+    assert len(asyncio.run(retriever.search(RRF_QUERY, k=5))) == 5
+
+    # k < candidate_k: the pool stays candidate_k per list.
+    (top,) = asyncio.run(retriever.search(RRF_QUERY, k=1))
+    assert top.chunk_id in pool_of_two
+    assert [top] == reciprocal_rank_fusion(top2_vector, top2_text, rrf_k=_RRF_K)[:1]
+
+
+# --- 4. identical content in two documents -------------------------------------------------
+
+
+def test_identical_content_in_two_documents_is_not_merged() -> None:
+    # SEQ_9 and ORCH_10 have the same chunk text (cross-product duplicate) but their own
+    # chunk ids, so they get the same vector and the same text score.
+    embedder, store, retriever = _seeded_with([SEQ_9, ORCH_10])
+    (seq_id,) = SEQ_9.chunk_ids
+    (orch_id,) = ORCH_10.chunk_ids
+    assert seq_id != orch_id
+    low_id, high_id = sorted([seq_id, orch_id])
+
+    # Precondition, checked on the real index: equal scores are ordered by chunk_id
+    # (SearchIndex contract), so the lower id is rank 1 and the higher rank 2 in BOTH lists.
+    vector_list, text_list = _direct_lists(embedder, store, EXPR_QUERY, None, n=10)
+    assert [r.chunk_id for r in vector_list] == [low_id, high_id]
+    assert [r.chunk_id for r in text_list] == [low_id, high_id]
+
+    results = asyncio.run(retriever.search(EXPR_QUERY, k=10))
+
+    assert [r.chunk_id for r in results] == [low_id, high_id]  # two results, not merged
+    assert {r.url for r in results} == {SEQ_9.url, ORCH_10.url}
+    assert [r.score for r in results] == [
+        float(Fraction(2, _RRF_K + 1)),  # rank 1 in both lists
+        float(Fraction(2, _RRF_K + 2)),  # rank 2 in both lists
+    ]
