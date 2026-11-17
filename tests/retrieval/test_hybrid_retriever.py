@@ -6,10 +6,12 @@ from typing import Any
 
 import pytest
 
+from contracts.common import DocType
 from contracts.retrieval import Filters, RetrievalError, Retriever, SearchResult
 from contracts.storage import EmbeddingError, IndexStoreError, InputType
 from kc.retrieval.hybrid_retriever import (
     DEFAULT_CANDIDATE_K,
+    DEFAULT_RELEASE_NOTES_WEIGHT,
     DEFAULT_TIMEOUT_S,
     HybridRetriever,
     _raise_translated,
@@ -22,7 +24,7 @@ QUERY_VECTOR = [1.0, 0.0, 0.0]
 LONG = 10.0  # "forever" for a test; such waits are always cancelled
 
 
-def _r(chunk_id: str) -> SearchResult:
+def _r(chunk_id: str, doc_type: DocType = "how-to") -> SearchResult:
     return SearchResult(
         chunk_id=chunk_id,
         url=f"https://knowledgecenter.gcora.genpact.com/help/{chunk_id}",
@@ -31,9 +33,13 @@ def _r(chunk_id: str) -> SearchResult:
         score=0.5,
         product="sequence",
         version="9",
-        doc_type="how-to",
+        doc_type=doc_type,
         heading_path=["Section"],
     )
+
+
+def _rn(chunk_id: str) -> SearchResult:
+    return _r(chunk_id, "release-notes")
 
 
 class Behavior:
@@ -213,6 +219,7 @@ def test_defaults() -> None:
     assert retriever._index is index
     assert retriever._candidate_k == DEFAULT_CANDIDATE_K == 50
     assert retriever._timeout_s == DEFAULT_TIMEOUT_S == 10.0
+    assert retriever._release_notes_weight == DEFAULT_RELEASE_NOTES_WEIGHT == 1.0
 
 
 def test_custom_settings_are_kept() -> None:
@@ -262,6 +269,29 @@ def test_timeout_s_wrong_type_raises_type_error(timeout_s: Any) -> None:
 def test_timeout_s_not_finite_or_not_positive_raises_value_error(timeout_s: float) -> None:
     with pytest.raises(ValueError, match="timeout_s"):
         _make(timeout_s=timeout_s)
+
+
+# --- release_notes_weight ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("weight", [1, 1.0, 0.5, 1e-9])
+def test_valid_release_notes_weight(weight: float) -> None:
+    assert _make(release_notes_weight=weight)._release_notes_weight == weight
+
+
+@pytest.mark.parametrize("weight", [True, False, "0.5", None])
+def test_release_notes_weight_wrong_type_raises_type_error(weight: Any) -> None:
+    with pytest.raises(TypeError, match="release_notes_weight"):
+        _make(release_notes_weight=weight)
+
+
+@pytest.mark.parametrize(
+    "weight",
+    [0, 0.0, -0.1, 1.0000001, 2, float("nan"), float("inf"), float("-inf")],
+)
+def test_release_notes_weight_out_of_range_raises_value_error(weight: float) -> None:
+    with pytest.raises(ValueError, match="release_notes_weight"):
+        _make(release_notes_weight=weight)
 
 
 # --- search: contract and input ----------------------------------------------------------
@@ -409,6 +439,87 @@ def test_output_is_sorted_with_unique_chunk_ids() -> None:
     results = _search(HybridRetriever(StubEmbedder(), StubIndex(vector, text)), "saml", k=10)
     assert len(_ids(results)) == len(set(_ids(results)))
     assert results == sorted(results, key=lambda r: (-r.score, r.chunk_id))
+
+
+# --- release notes weighting (after RRF, before the cut to k) ------------------------------
+#
+# Single-list RRF scores: rank 1 -> 1/61 ~ 0.01639, rank 2 -> 1/62 ~ 0.01613.
+
+
+def _weighted(
+    vector: list[SearchResult], text: list[SearchResult], weight: float, k: int = 10
+) -> list[SearchResult]:
+    index = StubIndex(vector, text)
+    return _search(HybridRetriever(StubEmbedder(), index, release_notes_weight=weight), "q", k=k)
+
+
+@pytest.mark.parametrize("weight", [None, 1.0])
+def test_weight_one_keeps_the_rrf_result_exactly(weight: float | None) -> None:
+    vector = [_rn("a"), _r("b"), _r("c")]
+    text = [_r("c"), _rn("a"), _rn("d")]
+    retriever = (
+        HybridRetriever(StubEmbedder(), StubIndex(vector, text))  # default weight
+        if weight is None
+        else HybridRetriever(StubEmbedder(), StubIndex(vector, text), release_notes_weight=weight)
+    )
+    assert _search(retriever, "q", k=10) == reciprocal_rank_fusion(vector, text)
+
+
+def test_only_release_note_scores_are_multiplied() -> None:
+    vector = [_rn("a"), _r("b"), _rn("c")]
+    text = [_r("b"), _r("d")]
+    fused = {r.chunk_id: r for r in reciprocal_rank_fusion(vector, text)}
+
+    results = _weighted(vector, text, weight=0.5)
+
+    assert len(results) == len(fused)
+    for r in results:
+        original = fused[r.chunk_id]
+        if r.doc_type == "release-notes":
+            assert r.score == original.score * 0.5
+        else:
+            assert r.score == original.score
+        assert r.model_dump(exclude={"score"}) == original.model_dump(exclude={"score"})
+
+
+def test_lower_ranked_how_to_moves_above_a_release_note() -> None:
+    vector = [_rn("rn"), _r("howto")]  # rn 1/61, howto 1/62
+    assert _ids(_weighted(vector, [], weight=1.0)) == ["rn", "howto"]  # precondition
+    # 0.9/61 ~ 0.01475 < 1/62 ~ 0.01613
+    assert _ids(_weighted(vector, [], weight=0.9)) == ["howto", "rn"]
+
+
+def test_highly_ranked_release_note_can_still_rank_first() -> None:
+    vector = [_rn("rn"), _r("x")]
+    text = [_r("y"), _rn("rn")]
+    # rn: (1/61 + 1/62) * 0.6 ~ 0.01951 beats y, the best single-list result: 1/61 ~ 0.01639
+    assert _ids(_weighted(vector, text, weight=0.6)) == ["rn", "y", "x"]
+
+
+def test_weighting_happens_before_the_cut_to_k() -> None:
+    vector = [_rn("rn"), _r("howto")]
+    assert _ids(_weighted(vector, [], weight=1.0, k=1)) == ["rn"]  # precondition
+    assert _ids(_weighted(vector, [], weight=0.9, k=1)) == ["howto"]
+
+
+def test_equal_weighted_scores_are_ordered_by_chunk_id() -> None:
+    # b (vector rank 1) and a (text rank 1) both get 1/61, then the same weight 0.5;
+    # c (vector rank 2, how-to) keeps 1/62 and moves above both.
+    results = _weighted([_rn("b"), _r("c")], [_rn("a")], weight=0.5)
+    scores = {r.chunk_id: r.score for r in results}
+    assert scores["a"] == scores["b"]
+    assert _ids(results) == ["c", "a", "b"]  # the tie a / b is broken by chunk_id
+
+
+def test_release_notes_only_keep_the_rrf_order() -> None:
+    vector = [_rn("a"), _rn("b"), _rn("c")]
+    text = [_rn("c"), _rn("d")]
+    fused = reciprocal_rank_fusion(vector, text)
+
+    results = _weighted(vector, text, weight=0.5)
+
+    assert _ids(results) == _ids(fused)
+    assert [r.score for r in results] == [r.score * 0.5 for r in fused]
 
 
 # --- errors: one infrastructure failure -> RetrievalError(cause=original) ----------------

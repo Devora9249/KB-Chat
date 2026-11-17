@@ -34,16 +34,23 @@ SAML_TEXT = "Use SAML to sign in with your identity provider."
 CMDLET_TEXT = "Run Set-CoraSeQuenceSiteAuthentication -AuthenticationType SAML."
 
 
+def _settings(candidate_k: int = 10, release_notes_weight: float = 1.0) -> RetrievalSettings:
+    # Explicit values (by env alias), no .env. The call stays on one line, so the ignore
+    # sits where mypy reports the error.
+    values: dict[str, Any] = {
+        "RETRIEVAL_CANDIDATE_K": candidate_k,
+        "RETRIEVAL_TIMEOUT_S": 5.0,
+        "RETRIEVAL_RELEASE_NOTES_WEIGHT": release_notes_weight,
+    }
+    return RetrievalSettings(_env_file=None, **values)  # type: ignore[call-arg]
+
+
 def _components(
     candidate_k: int = 10,
 ) -> tuple[FakeEmbedder, InMemoryIndexStore, HybridRetriever]:
     embedder = FakeEmbedder(dimension=DIM, model_name=MODEL)
     store = InMemoryIndexStore(dimension=DIM, model_name=MODEL)
-    # Explicit values (by env alias), no .env. The call stays on one line, so the ignore
-    # sits where mypy reports the error.
-    values: dict[str, Any] = {"RETRIEVAL_CANDIDATE_K": candidate_k, "RETRIEVAL_TIMEOUT_S": 5.0}
-    settings = RetrievalSettings(_env_file=None, **values)  # type: ignore[call-arg]
-    return embedder, store, create_hybrid_retriever(embedder, store, settings)
+    return embedder, store, create_hybrid_retriever(embedder, store, _settings(candidate_k))
 
 
 def _saml_document() -> SampleDocument:
@@ -516,3 +523,51 @@ def test_other_documents_survive_update_and_delete() -> None:
     assert_other_is_found()
     remaining = _find(retriever, f"{OLD_WORD} {NEW_WORD} {OTHER_WORD}")
     assert {r.url for r in remaining} == {OTHER_URL}
+
+
+# === F7: release notes weight =============================================================
+
+
+def test_lower_release_notes_weight_moves_a_how_to_above_a_release_note() -> None:
+    query = "configure saml authentication portal"
+    release_note = sample_document(
+        KC_HELP + "release-notes-saml-portal",
+        "Release Notes",
+        ["Configure SAML authentication portal release."],  # every query word
+        product="sequence",
+        version="9",
+        doc_type="release-notes",
+    )
+    how_to = sample_document(
+        KC_HELP + "configure-saml-portal",
+        "Configure SAML",
+        ["Configure SAML portal."],  # three of the four query words
+        product="sequence",
+        version="9",
+        doc_type="how-to",
+    )
+    embedder, store, full_weight = _seeded_with([release_note, how_to])
+    reduced_weight = create_hybrid_retriever(
+        embedder, store, _settings(release_notes_weight=0.9)
+    )  # same store
+
+    # Precondition, checked on the real index: the release note is rank 1 and the how-to
+    # rank 2 in BOTH lists, so with weight 1.0 they score 2/61 and 2/62.
+    vector_list, text_list = _direct_lists(embedder, store, query, None, n=10)
+    expected = [*release_note.chunk_ids, *how_to.chunk_ids]
+    assert [r.chunk_id for r in vector_list] == expected
+    assert [r.chunk_id for r in text_list] == expected
+
+    before = asyncio.run(full_weight.search(query, k=10))
+    assert [r.chunk_id for r in before] == expected
+    assert before[0].doc_type == "release-notes"
+
+    # 0.9 * 2/61 ~ 0.02951 < 2/62 ~ 0.03226: the how-to moves above the release note.
+    after = asyncio.run(reduced_weight.search(query, k=10))
+    assert [r.chunk_id for r in after] == [*how_to.chunk_ids, *release_note.chunk_ids]
+    scores = {r.chunk_id: r.score for r in after}
+    original = {r.chunk_id: r.score for r in before}
+    (rn_id,) = release_note.chunk_ids
+    (how_to_id,) = how_to.chunk_ids
+    assert scores[rn_id] == original[rn_id] * 0.9
+    assert scores[how_to_id] == original[how_to_id]
