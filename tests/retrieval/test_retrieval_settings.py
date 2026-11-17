@@ -8,14 +8,18 @@ from pydantic import ValidationError
 
 from contracts.retrieval import Filters, Retriever, SearchResult
 from contracts.storage import InputType
-from kc.retrieval.hybrid_retriever import DEFAULT_CANDIDATE_K, DEFAULT_TIMEOUT_S
+from kc.retrieval.hybrid_retriever import (
+    DEFAULT_CANDIDATE_K,
+    DEFAULT_RELEASE_NOTES_WEIGHT,
+    DEFAULT_TIMEOUT_S,
+)
 from kc.retrieval.settings import (
     RetrievalSettings,
     create_hybrid_retriever,
     load_retrieval_settings,
 )
 
-ENV_NAMES = ("RETRIEVAL_CANDIDATE_K", "RETRIEVAL_TIMEOUT_S")
+ENV_NAMES = ("RETRIEVAL_CANDIDATE_K", "RETRIEVAL_TIMEOUT_S", "RETRIEVAL_RELEASE_NOTES_WEIGHT")
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +41,7 @@ def test_defaults_come_from_hybrid_retriever() -> None:
     settings = _load()
     assert settings.candidate_k == DEFAULT_CANDIDATE_K == 50
     assert settings.timeout_s == DEFAULT_TIMEOUT_S == 10.0
+    assert settings.release_notes_weight == DEFAULT_RELEASE_NOTES_WEIGHT == 1.0
 
 
 def test_reads_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -133,6 +138,31 @@ def test_timeout_s_bool_is_rejected(value: bool) -> None:
         RetrievalSettings(_env_file=None, RETRIEVAL_TIMEOUT_S=value)  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize(("value", "expected"), [("0.5", 0.5), ("1", 1.0), ("0.001", 0.001)])
+def test_release_notes_weight_reads_from_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: float
+) -> None:
+    monkeypatch.setenv("RETRIEVAL_RELEASE_NOTES_WEIGHT", value)
+    assert _load().release_notes_weight == expected
+
+
+@pytest.mark.parametrize(
+    "value", ["0", "0.0", "-0.1", "1.01", "2", "nan", "inf", "-inf", "abc", "true", ""]
+)
+def test_release_notes_weight_invalid_value_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RETRIEVAL_RELEASE_NOTES_WEIGHT", value)
+    with pytest.raises(ValidationError, match="RETRIEVAL_RELEASE_NOTES_WEIGHT"):
+        _load()
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_release_notes_weight_bool_is_rejected(value: bool) -> None:
+    with pytest.raises(ValidationError, match="release_notes_weight must be a number"):
+        RetrievalSettings(_env_file=None, RETRIEVAL_RELEASE_NOTES_WEIGHT=value)  # type: ignore[call-arg]
+
+
 # --- factory -----------------------------------------------------------------------------
 
 
@@ -180,3 +210,10 @@ def test_factory_with_default_settings_uses_the_defaults() -> None:
     retriever = create_hybrid_retriever(_Embedder(), _Index(), _load())
     assert retriever._candidate_k == DEFAULT_CANDIDATE_K
     assert retriever._timeout_s == DEFAULT_TIMEOUT_S
+    assert retriever._release_notes_weight == DEFAULT_RELEASE_NOTES_WEIGHT
+
+
+def test_factory_passes_the_release_notes_weight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETRIEVAL_RELEASE_NOTES_WEIGHT", "0.25")
+    retriever = create_hybrid_retriever(_Embedder(), _Index(), _load())
+    assert retriever._release_notes_weight == 0.25

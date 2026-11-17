@@ -10,12 +10,19 @@ import re
 from collections.abc import Iterator, Sequence
 from typing import Final, NoReturn
 
+from contracts.common import DocType
 from contracts.retrieval import Filters, RetrievalError, SearchResult
 from contracts.storage import Embedder, EmbeddingError, IndexStoreError, SearchIndex
 from kc.retrieval.rrf import reciprocal_rank_fusion
 
+# Defaults; RetrievalSettings (kc.retrieval.settings) reads the configured values from the
+# environment and uses these when a variable is not set.
 DEFAULT_CANDIDATE_K: Final = 50
-DEFAULT_TIMEOUT_S: Final = 10.0  # temporary default; moves to settings later
+DEFAULT_TIMEOUT_S: Final = 10.0
+# Multiplier for the fused score of release notes (1.0 = no down-weighting). To be tuned
+# with evaluation metrics; no value below 1.0 has been chosen yet.
+DEFAULT_RELEASE_NOTES_WEIGHT: Final = 1.0
+_RELEASE_NOTES: Final[DocType] = "release-notes"
 _RRF_K: Final = 60
 # Same tokenization as FakeRetriever and InMemoryIndexStore.text_search.
 _TOKEN_RE: Final = re.compile(r"\w+", re.UNICODE)
@@ -92,6 +99,33 @@ def _check_timeout_s(timeout_s: float) -> None:
         raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s}")
 
 
+def _check_release_notes_weight(weight: float) -> None:
+    if isinstance(weight, bool) or not isinstance(weight, int | float):
+        raise TypeError(
+            f"release_notes_weight must be an int or float, got {type(weight).__name__}"
+        )
+    if not math.isfinite(weight) or not 0 < weight <= 1:
+        raise ValueError(f"release_notes_weight must be finite and in (0, 1], got {weight}")
+
+
+def _weight_release_notes(results: list[SearchResult], weight: float) -> list[SearchResult]:
+    """Multiply the score of release notes by `weight`, then re-sort.
+
+    Same order rule as RRF: score descending, ties by chunk_id ascending. With weight 1.0
+    the list is returned unchanged, so the RRF result is kept exactly.
+    """
+    if weight == 1.0:
+        return results
+    # model_copy(update=...) skips SearchResult validation. Safe here: the RRF score is a
+    # positive finite float and `weight` was validated as finite in (0, 1], so the product
+    # is finite too.
+    weighted = [
+        r.model_copy(update={"score": r.score * weight}) if r.doc_type == _RELEASE_NOTES else r
+        for r in results
+    ]
+    return sorted(weighted, key=lambda r: (-r.score, r.chunk_id))
+
+
 class HybridRetriever:
     """Retriever that combines vector search and full-text search.
 
@@ -107,11 +141,14 @@ class HybridRetriever:
             (the real request is max(candidate_k, k)).
         timeout_s: time budget for one search call, in seconds; when it expires both
             branches are cancelled (see `search` for why the real wait can be longer).
+        release_notes_weight: multiplier for the fused score of results with
+            doc_type "release-notes", in (0, 1]; 1.0 (the default) changes nothing.
 
     Raises:
-        TypeError: `candidate_k` is not an int, or `timeout_s` is not an int or float
-            (bool is rejected for both).
-        ValueError: `candidate_k` < 1, or `timeout_s` is not finite or is <= 0.
+        TypeError: `candidate_k` is not an int, or `timeout_s` / `release_notes_weight`
+            is not an int or float (bool is rejected for all three).
+        ValueError: `candidate_k` < 1, `timeout_s` is not finite or is <= 0, or
+            `release_notes_weight` is not finite or not in (0, 1].
     """
 
     def __init__(
@@ -121,13 +158,16 @@ class HybridRetriever:
         *,
         candidate_k: int = DEFAULT_CANDIDATE_K,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        release_notes_weight: float = DEFAULT_RELEASE_NOTES_WEIGHT,
     ) -> None:
         _check_positive_int(candidate_k, "candidate_k")
         _check_timeout_s(timeout_s)
+        _check_release_notes_weight(release_notes_weight)
         self._embedder = embedder
         self._index = index
         self._candidate_k = candidate_k
         self._timeout_s = timeout_s
+        self._release_notes_weight = release_notes_weight
 
     async def search(
         self, query: str, filters: Filters | None = None, k: int = 5
@@ -142,7 +182,11 @@ class HybridRetriever:
            candidates with the same `filters` object:
            - vector: embed([query], input_type="query"), then vector_search;
            - text: text_search(query) (starts without waiting for the embedding).
-        4. Fuse both lists with RRF (rank-based) and return the first `k`.
+        4. Fuse both lists with RRF (rank-based).
+        5. Multiply the score of release notes by `release_notes_weight` and re-sort
+           (score descending, ties by chunk_id); skipped when the weight is 1.0.
+           The returned `score` is then the weighted RRF score.
+        6. Return the first `k` (cut AFTER weighting, so a result below `k` can move up).
 
         One time budget (`timeout_s`) covers both branches; checks 1-2 run before it.
         `timeout_s` is when both branches are CANCELLED, not a hard limit on the wait:
@@ -206,7 +250,7 @@ class HybridRetriever:
             raise
 
         fused = reciprocal_rank_fusion(vector_results, text_results, rrf_k=_RRF_K)
-        return fused[:k]
+        return _weight_release_notes(fused, self._release_notes_weight)[:k]
 
     async def _run_branches(
         self, query: str, filters: Filters | None, n: int
