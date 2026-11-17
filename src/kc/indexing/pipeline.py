@@ -19,7 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from contracts.storage import Embedder, EmbeddingError
-from kc.indexing._provisional_contracts import Chunk, Document, IndexStore
+from kc.indexing._provisional_contracts import Chunk, Document, IndexWriter
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ async def index_document(
     chunks: list[Chunk],
     *,
     embedder: Embedder,
-    store: IndexStore,
+    store: IndexWriter,  # only writes; any IndexStore works
 ) -> None:
     """Embed and store one document. Raises EmbeddingError / ValueError; the index is then
     left exactly as it was before the call."""
@@ -55,7 +55,7 @@ async def index_documents(
     items: Iterable[tuple[Document, list[Chunk]]],
     *,
     embedder: Embedder,
-    store: IndexStore,
+    store: IndexWriter,  # only writes; any IndexStore works
 ) -> IndexReport:
     """Index many documents sequentially. A failing document is recorded and skipped, so one
     bad page does not stop the run. Only EmbeddingError and ValueError are caught; anything
