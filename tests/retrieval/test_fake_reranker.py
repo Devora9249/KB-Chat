@@ -10,7 +10,7 @@ import pytest
 
 from contracts.retrieval import SearchResult
 from kc.retrieval.fake_reranker import FakeReranker
-from kc.retrieval.reranker import Reranker
+from kc.retrieval.reranker import Reranker, RerankError
 
 
 def _item(chunk_id: str, text: str, **overrides: Any) -> SearchResult:
@@ -129,8 +129,9 @@ def test_explicit_scores_override_token_overlap() -> None:
 
 
 def test_chunk_missing_from_the_mapping_gets_zero() -> None:
-    results = _rerank(FakeReranker({"b": -1.0}), "saml", [_item("a", "saml"), _item("b", "x")])
-    assert [(r.chunk_id, r.score) for r in results] == [("a", 0.0), ("b", -1.0)]
+    # "a" would score 1.0 by token overlap; in mapping mode a missing id gets 0.0.
+    results = _rerank(FakeReranker({"b": 1.0}), "saml", [_item("a", "saml"), _item("b", "x")])
+    assert [(r.chunk_id, r.score) for r in results] == [("b", 1.0), ("a", 0.0)]
 
 
 def test_int_scores_are_accepted_as_float() -> None:
@@ -167,6 +168,18 @@ def test_mapping_with_a_non_finite_score_raises_value_error(score: float) -> Non
 def test_mapping_with_an_int_too_large_for_a_float_raises_value_error(score: int) -> None:
     with pytest.raises(ValueError, match="score for 'a' must be finite"):
         FakeReranker({"a": score})
+
+
+@pytest.mark.parametrize("score", [-1.0, -0.5, -1e-300, -1, -100])
+def test_mapping_with_a_negative_score_raises_value_error(score: float) -> None:
+    with pytest.raises(ValueError, match="score for 'a' must be >= 0"):
+        FakeReranker({"a": score})
+
+
+def test_mapping_accepts_zero_and_negative_zero_as_positive_zero() -> None:
+    results = _rerank(FakeReranker({"a": -0.0, "b": 0}), "q", [_item("a", "x"), _item("b", "x")])
+    assert [(r.chunk_id, r.score) for r in results] == [("a", 0.0), ("b", 0.0)]
+    assert all(math.copysign(1.0, r.score) == 1.0 for r in results)  # no -0.0 in the output
 
 
 def test_empty_mapping_scores_zero_instead_of_token_overlap() -> None:
@@ -208,6 +221,26 @@ def test_equal_mapping_scores_are_ordered_by_chunk_id() -> None:
 def test_results_are_cut_to_k() -> None:
     items = [_item(f"c{i}", "saml " * i) for i in range(5)]
     assert _ids(_rerank(FakeReranker(), "saml", items, k=2)) == ["c4", "c3"]
+
+
+@pytest.mark.parametrize(("k", "expected_len"), [(1, 1), (2, 2), (3, 3), (4, 3), (10, 3)])
+def test_output_length_is_exactly_min_of_k_and_unique_ids(k: int, expected_len: int) -> None:
+    # 4 inputs, 3 unique chunk_ids; one gets score 0 and is still returned (no filtering).
+    items = [_item("a", "saml"), _item("b", "x"), _item("a", "saml saml"), _item("c", "saml")]
+    results = _rerank(FakeReranker(), "saml", items, k=k)
+    assert len(results) == expected_len
+    if k >= 3:
+        assert sorted(_ids(results)) == ["a", "b", "c"]  # a full permutation of unique ids
+
+
+def test_rerank_error_is_a_runtime_error() -> None:
+    assert issubclass(RerankError, RuntimeError)
+    cause = OSError("provider down")
+    try:
+        raise RerankError("rerank failed") from cause
+    except RuntimeError as error:  # callers can catch it as RuntimeError
+        assert isinstance(error, RerankError)
+        assert error.__cause__ is cause
 
 
 def test_fewer_results_than_k_returns_all() -> None:
