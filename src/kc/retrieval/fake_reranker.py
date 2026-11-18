@@ -8,7 +8,9 @@ Score source:
   in the result's `text` that are query terms. Results with score 0 are KEPT (a reranker
   reorders candidates; it does not filter them).
 - `scores` mapping (chunk_id -> score): used instead of the overlap, to force a specific
-  order in tests; a chunk_id missing from the mapping gets 0.0.
+  order in tests; a chunk_id missing from the mapping gets 0.0. An EMPTY mapping
+  (`FakeReranker({})`) is still mapping mode, not token overlap: every result gets 0.0 and
+  the order is chunk_id ascending. Pass None (the default) for token overlap.
 The incoming `score` of a result is ignored.
 
 FakeReranker decisions (NOT required by the Reranker protocol):

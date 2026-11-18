@@ -1,6 +1,7 @@
 """Tests for FakeReranker and the Reranker protocol (Search & Ranking)."""
 
 import asyncio
+import itertools
 import math
 from collections.abc import Sequence
 from typing import Any
@@ -81,6 +82,19 @@ def test_scoring_matches_the_fake_retriever_convention() -> None:
     assert results[0].score == 2.0
 
 
+def test_hebrew_tokens_are_scored_deterministically() -> None:
+    items = [
+        _item("one", "איך להגדיר"),
+        _item("none", "טקסט אחר לגמרי"),
+        _item("two", "מגדירים SAML איך"),
+    ]
+    first = _rerank(FakeReranker(), "איך מגדירים SAML?", items)
+    second = _rerank(FakeReranker(), "איך מגדירים SAML?", items)
+
+    assert [(r.chunk_id, r.score) for r in first] == [("two", 3.0), ("one", 1.0), ("none", 0.0)]
+    assert first == second
+
+
 def test_ties_are_ordered_by_chunk_id() -> None:
     results = _rerank(
         FakeReranker(), "saml", [_item("c", "saml"), _item("a", "saml"), _item("b", "saml")]
@@ -153,6 +167,33 @@ def test_mapping_with_a_non_finite_score_raises_value_error(score: float) -> Non
 def test_mapping_with_an_int_too_large_for_a_float_raises_value_error(score: int) -> None:
     with pytest.raises(ValueError, match="score for 'a' must be finite"):
         FakeReranker({"a": score})
+
+
+def test_empty_mapping_scores_zero_instead_of_token_overlap() -> None:
+    items = [_item("b", "saml saml"), _item("a", "unrelated")]
+
+    overlap = _rerank(FakeReranker(), "saml", items)
+    empty_mapping = _rerank(FakeReranker({}), "saml", items)
+
+    assert [(r.chunk_id, r.score) for r in overlap] == [("b", 2.0), ("a", 0.0)]
+    assert [(r.chunk_id, r.score) for r in empty_mapping] == [("a", 0.0), ("b", 0.0)]
+
+
+def test_duplicate_chunk_id_in_mapping_mode_keeps_the_first_occurrence() -> None:
+    first = _item("a", "first text", title="First")
+    later = _item("a", "later text", title="Later", product="orchestration")
+
+    results = _rerank(FakeReranker({"a": 5.0}), "q", [first, later], k=1)
+
+    assert len(results) == 1
+    (result,) = results
+    assert result.score == 5.0
+    assert result.model_dump(exclude={"score"}) == first.model_dump(exclude={"score"})
+
+    # k larger than the input: only de-duplication can keep this to one result.
+    wide = _rerank(FakeReranker({"a": 5.0}), "q", [first, later], k=10)
+    assert len(wide) == 1
+    assert wide[0].model_dump(exclude={"score"}) == first.model_dump(exclude={"score"})
 
 
 def test_equal_mapping_scores_are_ordered_by_chunk_id() -> None:
@@ -256,6 +297,20 @@ def test_mutating_the_input_after_rerank_does_not_change_the_output() -> None:
 
     assert result == expected
     assert result.heading_path == ["Section", "a"]
+
+
+def test_input_order_does_not_change_the_output() -> None:
+    # Unique chunk_ids (with duplicates, the first occurrence depends on order by design).
+    items = [
+        _item("c", "saml saml"),
+        _item("a", "saml"),
+        _item("b", "saml"),
+        _item("d", "x"),
+    ]
+    expected = _rerank(FakeReranker(), "saml", items, k=3)
+    assert _ids(expected) == ["c", "a", "b"]
+    for permutation in itertools.permutations(items):
+        assert _rerank(FakeReranker(), "saml", list(permutation), k=3) == expected
 
 
 def test_is_deterministic() -> None:
