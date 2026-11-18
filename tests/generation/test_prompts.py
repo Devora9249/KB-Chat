@@ -101,3 +101,4 @@ def test_system_prompt_states_the_key_rules() -> None:
     assert "not_found" in prompt
     assert "needs_clarification" in prompt
     assert "language of the question" in prompt
+    assert "only answer questions about cora products" in prompt
