@@ -263,8 +263,9 @@ class HybridRetriever:
            spaces (the reranker replaces the RRF score, never reuses it), so each returned
            score is weighted exactly once.
            Fallback: if the reranker raises RerankError or TimeoutError (including its own
-           budget expiring), a warning is logged with only the error type and the pool size (no query text, no exception details) and the result
-           of step 5 is used, exactly as if no reranker were configured.
+            budget expiring), a warning is logged with only the error type and the pool
+            size (no query text, no exception details), and the result of step 5 is used,
+            exactly as if no reranker were configured.
         7. Return the first `k` (cut AFTER weighting, so a result below `k` can move up).
 
         One time budget (`timeout_s`) covers both branches; checks 1-2 run before it.
