@@ -2,7 +2,7 @@
 
 import pytest
 
-from contracts import Chunk
+from contracts.ingestion import Chunk
 from kc.ingestion.ids import content_hash, make_chunk_id
 
 URL = "https://knowledgecenter.gcora.genpact.com/help/configure-saml"
@@ -38,6 +38,7 @@ def test_chunk_id_matches_contract_format() -> None:
         text="x",
         heading_path=["A"],
         product="sequence",
+        version="9",
         doc_type="how-to",
     )
 

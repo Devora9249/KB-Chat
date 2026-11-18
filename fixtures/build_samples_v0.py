@@ -6,7 +6,7 @@ used as ground truth for answers (e.g. in the Golden Set). They will be replaced
 real crawled pages (same files, same schema) once the crawler is ready.
 
 Each sample covers one "hard case" from CLAUDE.md (cross-product duplicates, release
-notes, exact technical names, multi-version pages, product-independent pages).
+notes, exact technical names, a version-independent page).
 
 Run:  uv run python fixtures/build_samples_v0.py
 """
@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from contracts import Chunk, Document
+from contracts.ingestion import Chunk, Document, IngestedDocument
 from kc.ingestion.ids import content_hash, make_chunk_id
 
 BASE = "https://knowledgecenter.gcora.genpact.com/help/"
@@ -27,7 +27,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Configure SAML Authentication",
         "breadcrumb": ["Cora SeQuence 9.x", "Administration", "Authentication"],
         "product": "sequence",
-        "versions": ["9.x"],
+        "version": "9",
         "doc_type": "how-to",
         "body": (
             "Use SAML to let users sign in with your identity provider.\n\n"
@@ -48,7 +48,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Configure SAML Authentication",
         "breadcrumb": ["Cora Orchestration 10.x", "Administration", "Authentication"],
         "product": "orchestration",
-        "versions": ["10.x"],
+        "version": "10",
         "doc_type": "how-to",
         "body": (
             "In Cora Orchestration, SAML is configured from the Administration site.\n\n"
@@ -64,7 +64,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Expression Samples",
         "breadcrumb": ["Cora SeQuence 9.x", "Developer Guide", "Expressions"],
         "product": "sequence",
-        "versions": ["9.x"],
+        "version": "9",
         "doc_type": "reference",
         "body": (
             "Common expressions used in SeQuence workflows.\n\n"
@@ -79,7 +79,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Expression Samples",
         "breadcrumb": ["Cora Orchestration 10.x", "Developer Guide", "Expressions"],
         "product": "orchestration",
-        "versions": ["10.x"],
+        "version": "10",
         "doc_type": "reference",
         "body": (
             "Common expressions used in Orchestration workflows.\n\n"
@@ -94,8 +94,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Cora SeQuence 9.9.2 Release Notes",
         "breadcrumb": ["Cora SeQuence 9.x", "Release Notes"],
         "product": "sequence",
-        "versions": ["9.x"],
-        "release": "9.9.2",
+        "version": "9",
         "doc_type": "release-notes",
         "body": (
             "## New features\n\n"
@@ -109,8 +108,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Cora Orchestration 10.8 Release Notes",
         "breadcrumb": ["Cora Orchestration 10.x", "Release Notes"],
         "product": "orchestration",
-        "versions": ["10.x"],
-        "release": "10.8",
+        "version": "10",
         "doc_type": "release-notes",
         "body": (
             "## New features\n\n"
@@ -124,7 +122,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Error Handler Activity Fails",
         "breadcrumb": ["Cora Orchestration 10.x", "Troubleshooting"],
         "product": "orchestration",
-        "versions": ["10.x"],
+        "version": "10",
         "doc_type": "troubleshooting",
         "body": (
             "## Symptom\n\n"
@@ -135,12 +133,12 @@ SAMPLES: list[dict[str, Any]] = [
             "Connect the Error Handler output to a fallback step and republish the workflow."
         ),
     },
-    {  # Installation page that applies to several versions
+    {  # Installation page (covers 7.7-8.2 on the site; one version for now, see contract)
         "slug": "install-the-sequence-database-using-scripts",
         "title": "Install the SeQuence Database Using Scripts",
         "breadcrumb": ["Cora SeQuence 8.x", "Installation", "Versions 7.7 - 8.2"],
         "product": "sequence",
-        "versions": ["7.x", "8.x"],
+        "version": "8",
         "doc_type": "installation",
         "body": (
             "Install the database manually when the installer cannot reach SQL Server.\n\n"
@@ -157,7 +155,7 @@ SAMPLES: list[dict[str, Any]] = [
         "title": "Create a Case Type",
         "breadcrumb": ["Cora Case Manager 4.x", "Configuration"],
         "product": "case-manager",
-        "versions": ["4.x"],
+        "version": "4",
         "doc_type": "how-to",
         "body": (
             "A case type defines the fields and stages of a case.\n\n"
@@ -168,18 +166,19 @@ SAMPLES: list[dict[str, Any]] = [
             "Add at least one stage before you publish the case type."
         ),
     },
-    {  # Product-independent page, no versions
-        "slug": "glossary",
-        "title": "Glossary",
-        "breadcrumb": ["Glossary"],
-        "product": "general",
-        "versions": [],
-        "doc_type": "concept",
+    {  # Version-independent overview page
+        "slug": "cora-orchestration-platform",
+        "title": "Cora Orchestration Platform",
+        "breadcrumb": ["Cora Orchestration"],
+        "product": "orchestration",
+        "version": None,
+        "doc_type": "overview",
         "body": (
-            "## Activity\n\n"
-            "A single step in a workflow.\n\n"
-            "## Workflow\n\n"
-            "A sequence of activities that automates a business process."
+            "Cora Orchestration automates business processes with workflows.\n\n"
+            "## Key concepts\n\n"
+            "An **activity** is a single step in a workflow.\n\n"
+            "## Workflows\n\n"
+            "A workflow is a sequence of activities that automates a business process."
         ),
     },
 ]
@@ -206,25 +205,26 @@ def build() -> tuple[list[Document], list[Chunk]]:
             title=s["title"],
             breadcrumb=s["breadcrumb"],
             product=s["product"],
-            versions=s["versions"],
-            release=s.get("release"),
+            version=s["version"],
             doc_type=s["doc_type"],
             content_md=content_md,
             content_hash=content_hash(content_md),
         )
-        documents.append(doc)
-        for heading_path, text in split_by_h2(s["title"], s["body"]):
-            chunks.append(
-                Chunk(
-                    id=make_chunk_id(doc.url, heading_path, part=0),
-                    document_url=doc.url,
-                    text=text,
-                    heading_path=heading_path,
-                    product=doc.product,
-                    versions=doc.versions,
-                    doc_type=doc.doc_type,
-                )
+        doc_chunks = [
+            Chunk(
+                id=make_chunk_id(doc.url, heading_path, part=0),
+                document_url=doc.url,
+                text=text,
+                heading_path=heading_path,
+                product=doc.product,
+                version=doc.version,
+                doc_type=doc.doc_type,
             )
+            for heading_path, text in split_by_h2(s["title"], s["body"])
+        ]
+        IngestedDocument(document=doc, chunks=doc_chunks)  # strict checks, raises if invalid
+        documents.append(doc)
+        chunks.extend(doc_chunks)
     return documents, chunks
 
 

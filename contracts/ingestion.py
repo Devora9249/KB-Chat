@@ -1,9 +1,14 @@
 """Ingestion contract: the data the Ingestion pipeline hands to the rest of the system.
 
-Owner: Devora. Consumers: Storage & Indexing (Raizy), Search & Ranking (Racheli).
+Owner: Devora. Consumers: Storage & Indexing (Raizy), and through the index, Search.
 
-DRAFT: the value lists below are a proposal and still need agreement with the team
-(Raizy, Racheli) before this file is merged to `main`.
+Value lists (Product, DocType, Version) are shared and live in `contracts.common`.
+
+Two levels of checks:
+- `Document` and `Chunk` check the closed value lists only, so other domains can build
+  simple test data (e.g. url="u1").
+- `IngestedDocument`, what Ingestion actually produces, also checks URL, hash and chunk
+  id formats and that every chunk belongs to its document.
 
 Open questions (to settle in the PR):
 - content_hash: today it covers content_md only. If Enricher labels or chunking change
@@ -11,47 +16,20 @@ Open questions (to settle in the PR):
   + labels + an ingestion pipeline version.
 - Chunk.text does not repeat its headings. Proposal: the indexer embeds
   " > ".join(heading_path) + text, so a chunk keeps its context.
+- Pages that are not tied to one product (e.g. Glossary) have no valid `product`.
+  Proposal: add "general" to contracts.common.Product (backward compatible).
+- Pages that cover several versions (e.g. "Versions 7.7 - 8.2") get one `version`.
+  Revisit after the full crawl.
 - Pages removed from the site: IngestionSource has no way to report them yet (Sprint 3).
 """
 
+import re
 from collections.abc import AsyncIterator
-from typing import Annotated, Literal, Protocol
+from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-# ---------------------------------------------------------------------------
-# Closed value lists. Search filters match these strings exactly, so the Enricher
-# may only produce values from these lists ("Sequence" or "SeQuence" are rejected).
-# ---------------------------------------------------------------------------
-
-Product = Literal[
-    "orchestration",  # Cora Orchestration 10.x, Orchestration AI 11.x
-    "case-manager",  # Cora Case Manager 4.x
-    "sequence",  # Cora SeQuence 7.x-9.x (legacy name of Orchestration)
-    "opsmanager",  # Cora OpsManager (legacy name of Case Manager)
-    "general",  # pages not tied to one product (glossary, support matrix)
-]
-
-DocType = Literal[
-    "how-to",  # "Configure...", "Create...", "Add..."
-    "reference",  # PowerShell functions, expressions, API
-    "installation",  # installation, deployment, pre-deployment requirements
-    "troubleshooting",  # troubleshooting, known issues
-    "release-notes",  # down-weighted in search (they flood results)
-    "concept",  # overviews and explanations
-    "other",  # anything that fits none of the above
-]
-
-# Legacy product -> its current name. We keep both values in the data (their content
-# differs between versions), but search can use this map to widen a query if needed.
-PRODUCT_SUCCESSOR: dict[Product, Product] = {
-    "sequence": "orchestration",
-    "opsmanager": "case-manager",
-}
-
-# A product line as shown in the site navigation: "9.x", "10.x", "11.x", "4.x".
-VERSION_PATTERN = r"^\d+\.x$"
-Version = Annotated[str, Field(pattern=VERSION_PATTERN)]
+from contracts.common import DocType, Product, Version
 
 # A normalized article URL, exactly as listed in the site's sitemap.xml:
 #   https://knowledgecenter.gcora.genpact.com/help/<slug>
@@ -59,7 +37,13 @@ Version = Annotated[str, Field(pattern=VERSION_PATTERN)]
 # No trailing "/", no "?query", no "#fragment". Chunk ids are built from this URL, so
 # one page must always have exactly one spelling.
 KC_URL_PATTERN = r"^https://knowledgecenter\.gcora\.genpact\.com/help/[a-z0-9][a-z0-9-]*$"
-KcUrl = Annotated[str, Field(pattern=KC_URL_PATTERN)]
+
+# sha256 hex of content_md.
+CONTENT_HASH_PATTERN = r"^[0-9a-f]{64}$"
+
+# Deterministic and unique across the whole index:
+#   sha256(f"{document_url}|{' > '.join(heading_path)}|{part}")[:16]
+CHUNK_ID_PATTERN = r"^[0-9a-f]{16}$"
 
 
 class Document(BaseModel):
@@ -67,17 +51,14 @@ class Document(BaseModel):
 
     model_config = ConfigDict(extra="forbid")  # a typo in a field name is an error
 
-    url: KcUrl
+    url: str  # normalized article URL, see KC_URL_PATTERN
     title: str = Field(min_length=1)
     breadcrumb: list[str]  # e.g. ["Cora SeQuence 9.x", "Administration", "SAML"]
     product: Product
-    # Product lines this page applies to. Empty list = not version-specific.
-    versions: list[Version] = Field(default_factory=list)
-    # Exact release, only for release notes, e.g. "9.9.2".
-    release: str | None = None
+    version: Version | None  # major version, e.g. "9"; None = not version-specific
     doc_type: DocType
     content_md: str = Field(min_length=1)  # page body as Markdown
-    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")  # sha256 hex of content_md
+    content_hash: str  # see CONTENT_HASH_PATTERN
 
 
 class Chunk(BaseModel):
@@ -85,24 +66,26 @@ class Chunk(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # Deterministic and unique across the whole index:
-    # sha256(f"{document_url}|{' > '.join(heading_path)}|{part}")[:16]
-    id: str = Field(pattern=r"^[0-9a-f]{16}$")
-    document_url: KcUrl
+    id: str  # see CHUNK_ID_PATTERN
+    document_url: str
     text: str = Field(min_length=1)
     heading_path: list[str]  # headings above this chunk, e.g. ["Configure SAML", "Step 2"]
     # Copied from the parent Document so search can filter chunks directly.
     product: Product
-    versions: list[Version] = Field(default_factory=list)
+    version: Version | None
     doc_type: DocType
 
 
 class IngestedDocument(BaseModel):
     """One page together with all of its chunks (indexed as one unit).
 
-    Guarantees for consumers: there is at least one chunk, every chunk belongs to this
-    document and carries the same labels (product, versions, doc_type), and chunk ids
-    are unique within the document.
+    Guarantees for consumers:
+    - the URL is normalized, content_hash is a sha256 hex, chunk ids have the id format;
+    - there is at least one chunk;
+    - every chunk belongs to this document and carries the same product, version and
+      doc_type;
+    - chunk ids are unique within the document (and, since the URL is part of the id,
+      across the whole index).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -111,13 +94,19 @@ class IngestedDocument(BaseModel):
     chunks: list[Chunk] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _chunks_match_document(self) -> "IngestedDocument":
+    def _check(self) -> Self:
         doc = self.document
-        labels = (doc.product, doc.versions, doc.doc_type)
+        if not re.fullmatch(KC_URL_PATTERN, doc.url):
+            raise ValueError(f"url is not a normalized article URL: {doc.url!r}")
+        if not re.fullmatch(CONTENT_HASH_PATTERN, doc.content_hash):
+            raise ValueError(f"content_hash is not a sha256 hex: {doc.url}")
+        labels = (doc.product, doc.version, doc.doc_type)
         for chunk in self.chunks:
+            if not re.fullmatch(CHUNK_ID_PATTERN, chunk.id):
+                raise ValueError(f"bad chunk id format: {chunk.id!r}")
             if chunk.document_url != doc.url:
                 raise ValueError(f"chunk {chunk.id} belongs to {chunk.document_url}, not {doc.url}")
-            if (chunk.product, chunk.versions, chunk.doc_type) != labels:
+            if (chunk.product, chunk.version, chunk.doc_type) != labels:
                 raise ValueError(f"chunk {chunk.id} labels differ from its document {doc.url}")
         if len({c.id for c in self.chunks}) != len(self.chunks):
             raise ValueError(f"duplicate chunk ids in {doc.url}")

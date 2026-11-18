@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from contracts import Chunk, Document, IngestedDocument, IngestionSource
+from contracts.ingestion import Chunk, Document, IngestedDocument, IngestionSource
 
 FIXTURES_DIR = Path(__file__).resolve().parents[3] / "fixtures"
 

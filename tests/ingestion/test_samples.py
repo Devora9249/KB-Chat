@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from contracts import Chunk, Document, IngestedDocument, IngestionSource
+from contracts.ingestion import Chunk, Document, IngestedDocument, IngestionSource
 from fixtures.build_samples_v0 import build, write_jsonl
 from kc.ingestion.samples import SampleIngestionSource
 
@@ -55,11 +55,12 @@ def test_hard_cases_are_covered(items: list[IngestedDocument]) -> None:
     # same title in two products
     saml = {d.product for d in docs if d.title == "Configure SAML Authentication"}
     assert saml == {"sequence", "orchestration"}
-    # release notes with an exact release
-    assert any(d.doc_type == "release-notes" and d.release for d in docs)
-    # a page that applies to several versions, and one to none
-    assert any(len(d.versions) > 1 for d in docs)
-    assert any(d.product == "general" and d.versions == [] for d in docs)
+    # release notes (down-weighted in search)
+    assert any(d.doc_type == "release-notes" for d in docs)
+    # a page not tied to a version
+    assert any(d.version is None for d in docs)
+    # every product line that search filters on
+    assert {d.product for d in docs} >= {"sequence", "orchestration", "case-manager"}
     # an exact technical name, for text search
     assert any("Set-CoraSeQuenceSiteAuthentication" in c.text for c in all_chunks(items))
 

@@ -6,15 +6,15 @@ so every domain can build and test without waiting for the crawler.
 | File | Content |
 |---|---|
 | `sample_docs.jsonl` | 10 `Document`s, one JSON object per line |
-| `sample_chunks.jsonl` | 28 `Chunk`s belonging to those documents |
+| `sample_chunks.jsonl` | 29 `Chunk`s belonging to those documents |
 | `build_samples_v0.py` | Script that generates both files |
 
 ## How to use
 
-Depend on the `IngestionSource` Protocol from `contracts`, and receive it as a parameter:
+Depend on the `IngestionSource` Protocol from `contracts.ingestion`, and receive it as a parameter:
 
 ```python
-from contracts import IngestionSource
+from contracts.ingestion import IngestionSource
 
 
 async def index_all(source: IngestionSource) -> None:
@@ -34,15 +34,15 @@ On integration day only that line changes (to the real crawler-based source).
 Keep using `SampleIngestionSource` in unit tests: it is fast and needs no network.
 
 Every item is checked by the contract: it has at least one chunk, and every chunk
-belongs to its document and carries the same `product`, `versions` and `doc_type`.
+belongs to its document and carries the same `product`, `version` and `doc_type`.
 
 ## Hard cases included
 
 - Same title in two products: "Configure SAML Authentication", "Expression Samples"
   (`sequence` vs `orchestration`). Use these to test product filtering.
-- Release notes (`doc_type="release-notes"`, with `release`). Use these to test down-weighting.
+- Release notes (`doc_type="release-notes"`). Use these to test down-weighting.
 - Exact technical names (`Set-CoraSeQuenceSiteAuthentication`). Use these to test text search.
-- A page with several versions (`["7.x", "8.x"]`) and a `general` page with no versions.
+- A page not tied to a version (`version=None`).
 
 ## Important
 
