@@ -1,6 +1,7 @@
 """Tests for FakeReranker and the Reranker protocol (Search & Ranking)."""
 
 import asyncio
+import itertools
 import math
 from collections.abc import Sequence
 from typing import Any
@@ -9,7 +10,7 @@ import pytest
 
 from contracts.retrieval import SearchResult
 from kc.retrieval.fake_reranker import FakeReranker
-from kc.retrieval.reranker import Reranker
+from kc.retrieval.reranker import Reranker, RerankError
 
 
 def _item(chunk_id: str, text: str, **overrides: Any) -> SearchResult:
@@ -81,6 +82,19 @@ def test_scoring_matches_the_fake_retriever_convention() -> None:
     assert results[0].score == 2.0
 
 
+def test_hebrew_tokens_are_scored_deterministically() -> None:
+    items = [
+        _item("one", "איך להגדיר"),
+        _item("none", "טקסט אחר לגמרי"),
+        _item("two", "מגדירים SAML איך"),
+    ]
+    first = _rerank(FakeReranker(), "איך מגדירים SAML?", items)
+    second = _rerank(FakeReranker(), "איך מגדירים SAML?", items)
+
+    assert [(r.chunk_id, r.score) for r in first] == [("two", 3.0), ("one", 1.0), ("none", 0.0)]
+    assert first == second
+
+
 def test_ties_are_ordered_by_chunk_id() -> None:
     results = _rerank(
         FakeReranker(), "saml", [_item("c", "saml"), _item("a", "saml"), _item("b", "saml")]
@@ -115,8 +129,9 @@ def test_explicit_scores_override_token_overlap() -> None:
 
 
 def test_chunk_missing_from_the_mapping_gets_zero() -> None:
-    results = _rerank(FakeReranker({"b": -1.0}), "saml", [_item("a", "saml"), _item("b", "x")])
-    assert [(r.chunk_id, r.score) for r in results] == [("a", 0.0), ("b", -1.0)]
+    # "a" would score 1.0 by token overlap; in mapping mode a missing id gets 0.0.
+    results = _rerank(FakeReranker({"b": 1.0}), "saml", [_item("a", "saml"), _item("b", "x")])
+    assert [(r.chunk_id, r.score) for r in results] == [("b", 1.0), ("a", 0.0)]
 
 
 def test_int_scores_are_accepted_as_float() -> None:
@@ -155,6 +170,45 @@ def test_mapping_with_an_int_too_large_for_a_float_raises_value_error(score: int
         FakeReranker({"a": score})
 
 
+@pytest.mark.parametrize("score", [-1.0, -0.5, -1e-300, -1, -100])
+def test_mapping_with_a_negative_score_raises_value_error(score: float) -> None:
+    with pytest.raises(ValueError, match="score for 'a' must be >= 0"):
+        FakeReranker({"a": score})
+
+
+def test_mapping_accepts_zero_and_negative_zero_as_positive_zero() -> None:
+    results = _rerank(FakeReranker({"a": -0.0, "b": 0}), "q", [_item("a", "x"), _item("b", "x")])
+    assert [(r.chunk_id, r.score) for r in results] == [("a", 0.0), ("b", 0.0)]
+    assert all(math.copysign(1.0, r.score) == 1.0 for r in results)  # no -0.0 in the output
+
+
+def test_empty_mapping_scores_zero_instead_of_token_overlap() -> None:
+    items = [_item("b", "saml saml"), _item("a", "unrelated")]
+
+    overlap = _rerank(FakeReranker(), "saml", items)
+    empty_mapping = _rerank(FakeReranker({}), "saml", items)
+
+    assert [(r.chunk_id, r.score) for r in overlap] == [("b", 2.0), ("a", 0.0)]
+    assert [(r.chunk_id, r.score) for r in empty_mapping] == [("a", 0.0), ("b", 0.0)]
+
+
+def test_duplicate_chunk_id_in_mapping_mode_keeps_the_first_occurrence() -> None:
+    first = _item("a", "first text", title="First")
+    later = _item("a", "later text", title="Later", product="orchestration")
+
+    results = _rerank(FakeReranker({"a": 5.0}), "q", [first, later], k=1)
+
+    assert len(results) == 1
+    (result,) = results
+    assert result.score == 5.0
+    assert result.model_dump(exclude={"score"}) == first.model_dump(exclude={"score"})
+
+    # k larger than the input: only de-duplication can keep this to one result.
+    wide = _rerank(FakeReranker({"a": 5.0}), "q", [first, later], k=10)
+    assert len(wide) == 1
+    assert wide[0].model_dump(exclude={"score"}) == first.model_dump(exclude={"score"})
+
+
 def test_equal_mapping_scores_are_ordered_by_chunk_id() -> None:
     items = [_item("c", "x"), _item("a", "x"), _item("b", "x")]
     results = _rerank(FakeReranker({"a": 2.0, "b": 2.0, "c": 2.0}), "q", items)
@@ -167,6 +221,26 @@ def test_equal_mapping_scores_are_ordered_by_chunk_id() -> None:
 def test_results_are_cut_to_k() -> None:
     items = [_item(f"c{i}", "saml " * i) for i in range(5)]
     assert _ids(_rerank(FakeReranker(), "saml", items, k=2)) == ["c4", "c3"]
+
+
+@pytest.mark.parametrize(("k", "expected_len"), [(1, 1), (2, 2), (3, 3), (4, 3), (10, 3)])
+def test_output_length_is_exactly_min_of_k_and_unique_ids(k: int, expected_len: int) -> None:
+    # 4 inputs, 3 unique chunk_ids; one gets score 0 and is still returned (no filtering).
+    items = [_item("a", "saml"), _item("b", "x"), _item("a", "saml saml"), _item("c", "saml")]
+    results = _rerank(FakeReranker(), "saml", items, k=k)
+    assert len(results) == expected_len
+    if k >= 3:
+        assert sorted(_ids(results)) == ["a", "b", "c"]  # a full permutation of unique ids
+
+
+def test_rerank_error_is_a_runtime_error() -> None:
+    assert issubclass(RerankError, RuntimeError)
+    cause = OSError("provider down")
+    try:
+        raise RerankError("rerank failed") from cause
+    except RuntimeError as error:  # callers can catch it as RuntimeError
+        assert isinstance(error, RerankError)
+        assert error.__cause__ is cause
 
 
 def test_fewer_results_than_k_returns_all() -> None:
@@ -256,6 +330,20 @@ def test_mutating_the_input_after_rerank_does_not_change_the_output() -> None:
 
     assert result == expected
     assert result.heading_path == ["Section", "a"]
+
+
+def test_input_order_does_not_change_the_output() -> None:
+    # Unique chunk_ids (with duplicates, the first occurrence depends on order by design).
+    items = [
+        _item("c", "saml saml"),
+        _item("a", "saml"),
+        _item("b", "saml"),
+        _item("d", "x"),
+    ]
+    expected = _rerank(FakeReranker(), "saml", items, k=3)
+    assert _ids(expected) == ["c", "a", "b"]
+    for permutation in itertools.permutations(items):
+        assert _rerank(FakeReranker(), "saml", list(permutation), k=3) == expected
 
 
 def test_is_deterministic() -> None:

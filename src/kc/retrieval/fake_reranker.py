@@ -8,7 +8,11 @@ Score source:
   in the result's `text` that are query terms. Results with score 0 are KEPT (a reranker
   reorders candidates; it does not filter them).
 - `scores` mapping (chunk_id -> score): used instead of the overlap, to force a specific
-  order in tests; a chunk_id missing from the mapping gets 0.0.
+  order in tests; a chunk_id missing from the mapping gets 0.0. Every score must be a
+  finite int or float >= 0 (Reranker protocol); -0.0 is accepted and stored as 0.0.
+  An EMPTY mapping (`FakeReranker({})`) is still mapping mode, not token overlap: every
+  result gets 0.0 and the order is chunk_id ascending. Pass None (the default) for token
+  overlap.
 The incoming `score` of a result is ignored.
 
 FakeReranker decisions (NOT required by the Reranker protocol):
@@ -59,7 +63,9 @@ class FakeReranker:
                     ) from None
                 if not math.isfinite(as_float):
                     raise ValueError(f"score for {chunk_id!r} must be finite, got {score}")
-                checked[chunk_id] = as_float
+                if as_float < 0:  # -0.0 passes (it equals 0.0) and is stored as 0.0
+                    raise ValueError(f"score for {chunk_id!r} must be >= 0, got {score}")
+                checked[chunk_id] = as_float + 0.0  # -0.0 + 0.0 == +0.0
             # A private copy: later changes to the caller's mapping have no effect.
             self._scores = checked
 
