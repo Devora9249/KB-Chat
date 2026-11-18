@@ -18,7 +18,6 @@ from contracts.retrieval import SearchResult
 
 def ranked_unique_urls(results: Iterable[SearchResult]) -> list[str]:
     """Article URLs in rank order, each once (first occurrence keeps its rank)."""
-    # dict keeps insertion order, so this is an ordered de-duplication.
     return list(dict.fromkeys(result.url for result in results))
 
 

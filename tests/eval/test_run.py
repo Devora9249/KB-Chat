@@ -55,5 +55,4 @@ def test_main_rejects_k_below_1() -> None:
 
 
 def test_main_runs_on_real_golden_set_with_fake_retriever() -> None:
-    # Smoke test of the default wiring. Scores are meaningless (fake corpus has mock URLs).
     assert main([]) == 0

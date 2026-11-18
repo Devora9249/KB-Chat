@@ -37,7 +37,6 @@ class CaseResult:
 
 
 def _mean(values: list[float]) -> float | None:
-    # None (not 0.0) when nothing was scored: "no data" must not look like "all wrong".
     return fmean(values) if values else None
 
 

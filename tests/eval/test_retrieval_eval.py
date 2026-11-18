@@ -15,7 +15,6 @@ from eval.retrieval_eval import RetrievalReport, evaluate_retrieval, score_case
 
 
 def test_score_case_ranks_articles_not_chunks() -> None:
-    # Two chunks of article "a" must not push article "b" down to rank 3.
     results = [make_result(KC + "a"), make_result(KC + "a"), make_result(KC + "b")]
     scored = score_case(make_case(expected_urls=[KC + "b"]), results)
     assert scored.retrieved_urls == (KC + "a", KC + "b")
