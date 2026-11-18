@@ -15,8 +15,17 @@ from kc.api.app import (
     SEARCH_UNAVAILABLE,
     create_app,
 )
-from kc.api.dependencies import get_answerer, get_llm, get_retriever, get_settings
+from kc.api.dependencies import (
+    LLM_MAX_RETRIES,
+    LLM_TIMEOUT_S,
+    get_answerer,
+    get_anthropic_client,
+    get_llm,
+    get_retriever,
+    get_settings,
+)
 from kc.api.settings import ApiSettings
+from kc.generation.claude_llm import ClaudeLlmClient
 from kc.generation.fake_llm import FakeLlmClient
 from kc.generation.llm import GenerationError, LlmAnswer
 
@@ -102,6 +111,26 @@ def test_rag_answerer_uses_injected_retriever_and_llm(app: FastAPI, client: Test
     assert answer.citations[0].url.endswith("/configure-saml")
 
 
+def test_default_llm_is_the_fake() -> None:
+    assert isinstance(get_llm(settings()), FakeLlmClient)
+
+
+def test_llm_claude_builds_the_claude_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Building the client needs no API key and makes no call.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    llm = get_llm(settings(llm="claude", llm_model="claude-sonnet-5-5", llm_effort="high"))
+    assert isinstance(llm, ClaudeLlmClient)
+
+
+def test_anthropic_client_is_shared_and_bounded() -> None:
+    client = get_anthropic_client()
+    assert get_anthropic_client() is client  # one per process: reuses the connection pool
+    assert client.timeout == LLM_TIMEOUT_S
+    assert client.max_retries == LLM_MAX_RETRIES
+    # Worst case (every attempt times out) still fits inside the default overall deadline.
+    assert LLM_TIMEOUT_S * (LLM_MAX_RETRIES + 1) < settings().request_timeout_s
+
+
 def test_rag_answerer_works_with_the_default_fakes(app: FastAPI, client: TestClient) -> None:
     # FakeRetriever + FakeLlmClient, no overrides: the full path runs end to end.
     app.dependency_overrides[get_settings] = lambda: settings(answerer="rag")
@@ -158,19 +187,37 @@ def test_settings_defaults() -> None:
     assert defaults.answerer == "fake"
     assert defaults.request_timeout_s == 45.0
     assert defaults.rag_k == 5
+    assert defaults.llm == "fake"  # no real model calls unless asked for
+    assert defaults.llm_model == "claude-opus-5-5"
+    assert defaults.llm_effort == "medium"
 
 
 def test_settings_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("API_ANSWERER", "rag")
     monkeypatch.setenv("API_REQUEST_TIMEOUT_S", "30")
     monkeypatch.setenv("API_RAG_K", "8")
+    monkeypatch.setenv("API_LLM", "claude")
+    monkeypatch.setenv("API_LLM_MODEL", "claude-sonnet-5-5")
+    monkeypatch.setenv("API_LLM_EFFORT", "high")
     loaded = ApiSettings(_env_file=None)
     assert (loaded.answerer, loaded.request_timeout_s, loaded.rag_k) == ("rag", 30.0, 8)
+    assert (loaded.llm, loaded.llm_model, loaded.llm_effort) == (
+        "claude",
+        "claude-sonnet-5-5",
+        "high",
+    )
 
 
 @pytest.mark.parametrize(
     "bad",
-    [{"answerer": "claude"}, {"request_timeout_s": 0}, {"rag_k": 0}],
+    [
+        {"answerer": "claude"},
+        {"request_timeout_s": 0},
+        {"rag_k": 0},
+        {"llm": "openai"},
+        {"llm_model": ""},
+        {"llm_effort": "extreme"},
+    ],
 )
 def test_settings_reject_invalid_values(bad: dict[str, object]) -> None:
     with pytest.raises(ValueError):
