@@ -151,9 +151,12 @@ def test_environment_and_dot_env_do_not_affect_the_factory(
     # Invalid values: if the factory read them, RetrievalSettings would raise.
     monkeypatch.setenv("RETRIEVAL_TIMEOUT_S", "abc")
     monkeypatch.setenv("RETRIEVAL_CANDIDATE_K", "0")
+    monkeypatch.setenv("RETRIEVAL_RERANK_CANDIDATES", "abc")
+    monkeypatch.setenv("RETRIEVAL_RERANK_TIMEOUT_S", "-1")
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
-        "RETRIEVAL_TIMEOUT_S=-1\nRETRIEVAL_CANDIDATE_K=abc\nRETRIEVAL_RELEASE_NOTES_WEIGHT=5\n",
+        "RETRIEVAL_TIMEOUT_S=-1\nRETRIEVAL_CANDIDATE_K=abc\nRETRIEVAL_RELEASE_NOTES_WEIGHT=5\n"
+        "RETRIEVAL_RERANK_CANDIDATES=0\nRETRIEVAL_RERANK_TIMEOUT_S=nan\n",
         encoding="utf-8",
     )
 

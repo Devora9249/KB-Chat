@@ -1,7 +1,10 @@
 """Tests for HybridRetriever (Search & Ranking)."""
 
 import asyncio
+import logging
+import math
 import traceback
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import pytest
@@ -12,10 +15,13 @@ from contracts.storage import EmbeddingError, IndexStoreError, InputType
 from kc.retrieval.hybrid_retriever import (
     DEFAULT_CANDIDATE_K,
     DEFAULT_RELEASE_NOTES_WEIGHT,
+    DEFAULT_RERANK_CANDIDATES,
+    DEFAULT_RERANK_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
     HybridRetriever,
     _raise_translated,
 )
+from kc.retrieval.reranker import RerankError
 from kc.retrieval.rrf import reciprocal_rank_fusion
 
 # --- Local async stubs (no imports of other domains' implementations) --------------------
@@ -145,6 +151,36 @@ class StubIndex:
         return [r.model_copy(deep=True) for r in self._text_results]
 
 
+class StubReranker:
+    """Records every call. Scores from `scores` (missing id -> 0.0), or a forced `output`.
+
+    Follows the Reranker protocol unless `output` is given (used to break it on purpose).
+    """
+
+    def __init__(
+        self,
+        scores: dict[str, float] | None = None,
+        *,
+        behavior: Behavior | None = None,
+        output: Callable[[list[SearchResult]], list[SearchResult]] | None = None,
+    ) -> None:
+        self._scores = scores or {}
+        self.behavior = behavior or Behavior()
+        self._output = output
+        self.calls: list[tuple[str, list[SearchResult], int]] = []
+
+    async def rerank(
+        self, query: str, results: Sequence[SearchResult], *, k: int
+    ) -> list[SearchResult]:
+        pool = [r.model_copy(deep=True) for r in results]
+        self.calls.append((query, pool, k))
+        await self.behavior.run()
+        if self._output is not None:
+            return self._output(pool)
+        scored = [r.model_copy(update={"score": self._scores.get(r.chunk_id, 0.0)}) for r in pool]
+        return sorted(scored, key=lambda r: (-r.score, r.chunk_id))[:k]
+
+
 def _make(**kwargs: Any) -> HybridRetriever:
     return HybridRetriever(StubEmbedder(), StubIndex(), **kwargs)
 
@@ -220,6 +256,9 @@ def test_defaults() -> None:
     assert retriever._candidate_k == DEFAULT_CANDIDATE_K == 50
     assert retriever._timeout_s == DEFAULT_TIMEOUT_S == 10.0
     assert retriever._release_notes_weight == DEFAULT_RELEASE_NOTES_WEIGHT == 1.0
+    assert retriever._reranker is None
+    assert retriever._rerank_candidates == DEFAULT_RERANK_CANDIDATES == 20
+    assert retriever._rerank_timeout_s == DEFAULT_RERANK_TIMEOUT_S == 3.0
 
 
 def test_custom_settings_are_kept() -> None:
@@ -938,10 +977,14 @@ def test_cancel_while_runner_is_running_keeps_existing_behavior(
 # --- state: search never changes the instance --------------------------------------------
 
 
-@pytest.mark.parametrize("scenario", ["success", "infra_failure", "timeout"])
+@pytest.mark.parametrize("scenario", ["success", "rerank_fallback", "infra_failure", "timeout"])
 def test_search_does_not_change_instance_state(scenario: str) -> None:
     if scenario == "success":
         retriever = HybridRetriever(StubEmbedder(), StubIndex([_r("a")], [_r("b")]))
+    elif scenario == "rerank_fallback":
+        reranker = StubReranker(behavior=Behavior(error=RerankError("down")))
+        index = StubIndex([_r("a")], [_r("b")])
+        retriever = HybridRetriever(StubEmbedder(), index, reranker=reranker)
     elif scenario == "infra_failure":
         index = StubIndex(text=Behavior(error=IndexStoreError("text down")))
         retriever = HybridRetriever(StubEmbedder(), index)
@@ -950,7 +993,7 @@ def test_search_does_not_change_instance_state(scenario: str) -> None:
 
     before = dict(vars(retriever))  # snapshot: names and the exact objects
 
-    if scenario == "success":
+    if scenario in ("success", "rerank_fallback"):
         assert _ids(_search(retriever, "saml")) == ["a", "b"]
     else:
         exc = _run_and_capture(retriever)  # also checks that no task is left running
@@ -1285,3 +1328,360 @@ def test_no_task_is_left_after_success() -> None:
         assert _other_tasks() == set()
 
     asyncio.run(scenario())
+
+
+# === F9: optional reranker (after RRF + release-notes weighting, before the cut) =========
+
+FIVE = [_r("a"), _r("b"), _r("c"), _r("d"), _r("e")]  # vector list only: RRF keeps a..e
+LOGGER = "kc.retrieval.hybrid_retriever"
+
+
+def _with_reranker(
+    reranker: StubReranker,
+    vector: list[SearchResult],
+    text: list[SearchResult] | None = None,
+    **kwargs: Any,
+) -> HybridRetriever:
+    return HybridRetriever(StubEmbedder(), StubIndex(vector, text), reranker=reranker, **kwargs)
+
+
+def _no_reranker(
+    vector: list[SearchResult], text: list[SearchResult] | None = None, **kwargs: Any
+) -> HybridRetriever:
+    return HybridRetriever(StubEmbedder(), StubIndex(vector, text), **kwargs)
+
+
+def _scores(results: list[SearchResult]) -> dict[str, float]:
+    return {r.chunk_id: r.score for r in results}
+
+
+# --- construction ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rerank_candidates", [1, 20, 1000])
+def test_valid_rerank_candidates(rerank_candidates: int) -> None:
+    assert _make(rerank_candidates=rerank_candidates)._rerank_candidates == rerank_candidates
+
+
+@pytest.mark.parametrize("rerank_candidates", [True, False, 5.0, "5", None])
+def test_rerank_candidates_wrong_type_raises_type_error(rerank_candidates: Any) -> None:
+    with pytest.raises(TypeError, match="rerank_candidates must be an int"):
+        _make(rerank_candidates=rerank_candidates)
+
+
+@pytest.mark.parametrize("rerank_candidates", [0, -1])
+def test_rerank_candidates_below_one_raises_value_error(rerank_candidates: int) -> None:
+    with pytest.raises(ValueError, match="rerank_candidates must be >= 1"):
+        _make(rerank_candidates=rerank_candidates)
+
+
+@pytest.mark.parametrize("rerank_timeout_s", [0.001, 3, 3.0, 60.0])
+def test_valid_rerank_timeout_s(rerank_timeout_s: float) -> None:
+    assert _make(rerank_timeout_s=rerank_timeout_s)._rerank_timeout_s == rerank_timeout_s
+
+
+@pytest.mark.parametrize("rerank_timeout_s", [True, False, "3", None])
+def test_rerank_timeout_s_wrong_type_raises_type_error(rerank_timeout_s: Any) -> None:
+    with pytest.raises(TypeError, match="rerank_timeout_s must be an int or float"):
+        _make(rerank_timeout_s=rerank_timeout_s)
+
+
+@pytest.mark.parametrize("rerank_timeout_s", [0, 0.0, -1.0, math.nan, math.inf, -math.inf])
+def test_rerank_timeout_s_not_finite_or_not_positive_raises_value_error(
+    rerank_timeout_s: float,
+) -> None:
+    with pytest.raises(ValueError, match="rerank_timeout_s must be finite and > 0"):
+        _make(rerank_timeout_s=rerank_timeout_s)
+
+
+def test_reranker_is_keyword_only() -> None:
+    untyped: Any = HybridRetriever  # mypy already rejects this call; check it at runtime
+    with pytest.raises(TypeError):
+        untyped(StubEmbedder(), StubIndex(), StubReranker())
+
+
+# --- no reranker: behaviour unchanged ----------------------------------------------------
+
+
+def test_without_a_reranker_rerank_settings_change_nothing() -> None:
+    vector, text = [_rn("a"), _r("b"), _r("c")], [_r("c"), _rn("d")]
+    plain = _search(_no_reranker(vector, text, release_notes_weight=0.5), "q", k=10)
+    tuned = _search(
+        _no_reranker(
+            vector, text, release_notes_weight=0.5, rerank_candidates=1, rerank_timeout_s=0.001
+        ),
+        "q",
+        k=10,
+    )
+    assert tuned == plain
+
+
+# --- the candidate pool --------------------------------------------------------------------
+
+
+def test_reranker_gets_the_top_rerank_candidates_with_k_equal_to_the_pool() -> None:
+    reranker = StubReranker()
+    _search(_with_reranker(reranker, FIVE, rerank_candidates=3), "q", k=2)
+
+    ((query, pool, k),) = reranker.calls
+    assert query == "q"
+    assert pool == reciprocal_rank_fusion(FIVE, [])[:3]  # same order, same RRF scores
+    assert k == len(pool) == 3  # all of them, not the final k
+
+
+def test_pool_is_at_least_k() -> None:
+    reranker = StubReranker()
+    results = _search(_with_reranker(reranker, FIVE, rerank_candidates=2), "q", k=4)
+    assert _ids(reranker.calls[0][1]) == ["a", "b", "c", "d"]
+    assert len(results) == 4
+
+
+def test_pool_is_capped_by_the_number_of_results() -> None:
+    reranker = StubReranker()
+    _search(_with_reranker(reranker, FIVE, rerank_candidates=20), "q", k=2)
+    ((_, pool, k),) = reranker.calls
+    assert _ids(pool) == ["a", "b", "c", "d", "e"]
+    assert k == 5
+
+
+def test_release_notes_weight_decides_pool_membership() -> None:
+    # rn 1/61, x 1/62: weight 0.9 puts x first (0.9/61 < 1/62), so only x enters a pool of 1.
+    vector = [_rn("rn"), _r("x"), _r("y")]
+    full, reduced = StubReranker(), StubReranker()
+    _search(_with_reranker(full, vector, rerank_candidates=1), "q", k=1)
+    _search(
+        _with_reranker(reduced, vector, rerank_candidates=1, release_notes_weight=0.9), "q", k=1
+    )
+    assert _ids(full.calls[0][1]) == ["rn"]
+    assert _ids(reduced.calls[0][1]) == ["x"]
+
+
+@pytest.mark.parametrize("query", ["", "   ", "?!"])
+def test_query_without_tokens_never_calls_the_reranker(query: str) -> None:
+    reranker = StubReranker()
+    assert _search(_with_reranker(reranker, FIVE), query) == []
+    assert reranker.calls == []
+
+
+def test_no_results_never_calls_the_reranker() -> None:
+    reranker = StubReranker()
+    assert _search(_with_reranker(reranker, []), "q") == []
+    assert reranker.calls == []
+
+
+# --- order, k and the two score spaces -------------------------------------------------------
+
+
+def test_output_follows_the_reranker_scores() -> None:
+    reranker = StubReranker({"c": 3.0, "e": 2.0, "a": 1.0})
+    results = _search(_with_reranker(reranker, FIVE), "q", k=10)
+    assert [(r.chunk_id, r.score) for r in results] == [
+        ("c", 3.0),
+        ("e", 2.0),
+        ("a", 1.0),
+        ("b", 0.0),  # missing from the stub's mapping: 0.0, kept (reorder, not filter)
+        ("d", 0.0),
+    ]
+
+
+def test_equal_reranker_scores_are_ordered_by_chunk_id() -> None:
+    reranker = StubReranker({"e": 1.0, "c": 1.0, "a": 1.0, "b": 2.0})
+    assert _ids(_search(_with_reranker(reranker, FIVE), "q", k=4)) == ["b", "a", "c", "e"]
+
+
+def test_release_note_score_is_the_reranker_score_times_the_weight_once() -> None:
+    vector = [_rn("rn"), _r("howto")]
+    reranker = StubReranker({"rn": 0.8, "howto": 0.5})
+    results = _search(_with_reranker(reranker, vector, release_notes_weight=0.5), "q", k=10)
+    # 0.8 * 0.5 = 0.4: not the RRF score, not 0.8 * 0.5**2 (weighted twice)
+    assert _scores(results) == {"howto": 0.5, "rn": 0.8 * 0.5}
+    assert _ids(results) == ["howto", "rn"]
+
+
+def test_weight_one_returns_the_reranker_output_exactly() -> None:
+    vector = [_rn("rn"), _r("x"), _r("y")]
+    reranker = StubReranker({"y": 0.9, "rn": 0.7, "x": 0.1})
+    results = _search(_with_reranker(reranker, vector), "q", k=10)
+    assert [(r.chunk_id, r.score) for r in results] == [("y", 0.9), ("rn", 0.7), ("x", 0.1)]
+
+
+def test_int_reranker_score_becomes_a_float() -> None:
+    def int_scores(pool: list[SearchResult]) -> list[SearchResult]:
+        # model_copy skips validation, so the int is stored as is (a valid score >= 0).
+        return [r.model_copy(update={"score": 3 if r.chunk_id == "a" else 1}) for r in pool]
+
+    reranker = StubReranker(output=int_scores)
+    results = _search(_with_reranker(reranker, FIVE, rerank_candidates=3), "q", k=3)
+
+    assert [(r.chunk_id, r.score) for r in results] == [("a", 3.0), ("b", 1.0), ("c", 1.0)]
+    assert all(type(r.score) is float for r in results)
+    by_id = {r.chunk_id: r for r in FIVE}
+    for r in results:  # every other field is kept
+        assert r.model_dump(exclude={"score"}) == by_id[r.chunk_id].model_dump(exclude={"score"})
+
+
+def test_cut_to_k_happens_after_the_second_weighting() -> None:
+    # Reranker order: rn1 3.0, rn2 2.9, howto 1.0. Weight 0.3: rn1 0.9, rn2 0.87, so the
+    # how-to (third for the reranker) becomes the only result for k=1.
+    vector = [_rn("rn1"), _rn("rn2"), _r("howto")]
+    scores = {"rn1": 3.0, "rn2": 2.9, "howto": 1.0}
+    assert _ids(_search(_with_reranker(StubReranker(scores), vector), "q", k=1)) == ["rn1"]
+    weighted = _with_reranker(StubReranker(scores), vector, release_notes_weight=0.3)
+    assert _ids(_search(weighted, "q", k=1)) == ["howto"]
+
+
+def test_fields_other_than_score_match_the_indexed_results() -> None:
+    reranker = StubReranker({"b": 1.0})
+    results = _search(_with_reranker(reranker, FIVE), "q", k=10)
+    by_id = {r.chunk_id: r for r in FIVE}
+    for r in results:
+        assert r.model_dump(exclude={"score"}) == by_id[r.chunk_id].model_dump(exclude={"score"})
+
+
+# --- fallback: RerankError / TimeoutError -> the RRF ranking -------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Messages that echo the request, as a provider error might: must not be logged.
+        RerankError("provider down for 'secret customer question saml' (detail-x)"),
+        TimeoutError("provider timeout, request body: secret customer question (detail-x)"),
+    ],
+)
+def test_infra_failure_falls_back_to_the_weighted_rrf_ranking(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    vector, text = [_rn("a"), _r("b"), _r("c")], [_r("c"), _rn("d")]
+    reranker = StubReranker({"d": 9.0}, behavior=Behavior(error=error))
+    query = "secret customer question saml"
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        results = _search(
+            _with_reranker(reranker, vector, text, release_notes_weight=0.5), query, k=3
+        )
+
+    # Identical results AND scores (weighted once, in the RRF score space) to no reranker.
+    assert results == _search(_no_reranker(vector, text, release_notes_weight=0.5), query, k=3)
+    assert len(reranker.calls) == 1
+    (record,) = [r for r in caplog.records if r.name == LOGGER]
+    assert record.levelno == logging.WARNING
+    assert "falling back" in record.getMessage()
+    assert type(error).__name__ in record.getMessage()
+    assert record.exc_info is None  # no traceback attached
+    # Nothing from the query or the exception, anywhere in the formatted log output.
+    assert "secret" not in caplog.text
+    assert "detail-x" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_reranker_timeout_falls_back_and_cancels_the_reranker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reranker = StubReranker({"e": 9.0}, behavior=Behavior(delay=LONG))
+
+    async def scenario() -> list[SearchResult]:
+        retriever = _with_reranker(reranker, FIVE, timeout_s=LONG, rerank_timeout_s=0.05)
+        results = await retriever.search("q", k=2)
+        assert _other_tasks() == set()
+        return results
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        results = asyncio.run(scenario())
+
+    assert _ids(results) == ["a", "b"]  # the RRF ranking
+    assert reranker.behavior.cancelled  # its work was cancelled by the budget
+    assert any("TimeoutError" in r.getMessage() for r in caplog.records if r.name == LOGGER)
+
+
+# --- bugs are raised, never a fallback ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("bug"),
+        TypeError("bug"),
+        ExceptionGroup("group", [RerankError("inside a group")]),
+    ],
+)
+def test_other_reranker_errors_are_raised_unchanged(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    reranker = StubReranker(behavior=Behavior(error=error))
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        exc = _run_and_capture(_with_reranker(reranker, FIVE))
+    assert exc is error
+    assert not [r for r in caplog.records if r.name == LOGGER]  # no fallback
+
+
+def _replace_score(value: Any) -> Callable[[list[SearchResult]], list[SearchResult]]:
+    # model_copy(update=...) skips validation, so a broken reranker can return anything.
+    return lambda pool: [pool[0].model_copy(update={"score": value}), *pool[1:]]
+
+
+@pytest.mark.parametrize(
+    ("output", "message"),
+    [
+        (lambda pool: pool[:-1], "returned 2 results for 3 candidates"),
+        (lambda pool: [*pool, _r("zzz")], "returned 4 results for 3 candidates"),
+        (lambda pool: [*pool[:-1], _r("zzz")], r"missing \['c'\], extra \['zzz'\]"),
+        (lambda pool: [pool[0], pool[0], pool[1]], r"duplicate chunk_ids: \['a'\]"),
+        (_replace_score(-1.0), "must be >= 0, got -1.0"),
+        (_replace_score(-1), "must be >= 0, got -1"),
+        (_replace_score(math.nan), "must be finite"),
+        (_replace_score(math.inf), "must be finite"),
+        (_replace_score(-math.inf), "must be finite"),
+        (_replace_score(10**400), "must be finite, got an int too large for a float"),
+        (_replace_score(None), "must be a number, got NoneType"),
+        (_replace_score(True), "must be a number, got bool"),
+        (_replace_score("1.0"), "must be a number, got str"),
+    ],
+)
+def test_invalid_reranker_output_raises_value_error(
+    output: Callable[[list[SearchResult]], list[SearchResult]], message: str
+) -> None:
+    reranker = StubReranker(output=output)
+    retriever = _with_reranker(reranker, FIVE, rerank_candidates=3)
+    with pytest.raises(ValueError, match=message):
+        _search(retriever, "q", k=3)
+
+
+def test_score_overflow_from_model_copy_raises_a_clear_value_error() -> None:
+    huge = _r("a").model_copy(update={"score": 10**400})
+    with pytest.raises(OverflowError):  # what math.isfinite alone would raise
+        math.isfinite(huge.score)
+    reranker = StubReranker(output=lambda pool: [huge, *pool[1:]])
+    with pytest.raises(ValueError, match="reranker score for 'a' must be finite"):
+        _search(_with_reranker(reranker, FIVE, rerank_candidates=3), "q", k=3)
+
+
+def test_zero_scores_are_valid_output() -> None:
+    reranker = StubReranker({})  # every score 0.0
+    results = _search(_with_reranker(reranker, FIVE), "q", k=10)
+    assert [(r.chunk_id, r.score) for r in results] == [(i, 0.0) for i in "abcde"]
+
+
+# --- cancellation during reranking -------------------------------------------------------
+
+
+def test_external_cancel_during_reranking_is_not_a_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reranker = StubReranker(behavior=Behavior(delay=LONG))
+
+    async def scenario() -> None:
+        retriever = _with_reranker(reranker, FIVE, rerank_timeout_s=LONG)
+        task = asyncio.create_task(retriever.search("q"))
+        await asyncio.wait_for(reranker.behavior.started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+        assert _other_tasks() == set()
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        asyncio.run(scenario())
+
+    assert reranker.behavior.cancelled
+    assert not [r for r in caplog.records if r.name == LOGGER]  # no fallback, no warning

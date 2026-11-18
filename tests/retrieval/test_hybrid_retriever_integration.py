@@ -18,7 +18,13 @@ from contracts.retrieval import Filters, Retriever, SearchResult
 from kc.indexing.fake_embedder import FakeEmbedder
 from kc.indexing.in_memory_index_store import InMemoryIndexStore
 from kc.indexing.testing import SampleDocument, sample_document, seed_index
-from kc.retrieval.hybrid_retriever import _RRF_K, HybridRetriever
+from kc.retrieval.fake_reranker import FakeReranker
+from kc.retrieval.hybrid_retriever import (
+    _RRF_K,
+    DEFAULT_RERANK_CANDIDATES,
+    DEFAULT_RERANK_TIMEOUT_S,
+    HybridRetriever,
+)
 from kc.retrieval.rrf import reciprocal_rank_fusion
 from kc.retrieval.settings import RetrievalSettings, create_hybrid_retriever
 
@@ -41,6 +47,8 @@ def _settings(candidate_k: int = 10, release_notes_weight: float = 1.0) -> Retri
         "RETRIEVAL_CANDIDATE_K": candidate_k,
         "RETRIEVAL_TIMEOUT_S": 5.0,
         "RETRIEVAL_RELEASE_NOTES_WEIGHT": release_notes_weight,
+        "RETRIEVAL_RERANK_CANDIDATES": DEFAULT_RERANK_CANDIDATES,
+        "RETRIEVAL_RERANK_TIMEOUT_S": DEFAULT_RERANK_TIMEOUT_S,
     }
     return RetrievalSettings(_env_file=None, **values)  # type: ignore[call-arg]
 
@@ -571,3 +579,66 @@ def test_lower_release_notes_weight_moves_a_how_to_above_a_release_note() -> Non
     (how_to_id,) = how_to.chunk_ids
     assert scores[rn_id] == original[rn_id] * 0.9
     assert scores[how_to_id] == original[how_to_id]
+
+
+# === F9: FakeReranker in the full pipeline ================================================
+
+RERANK_QUERY = "configure saml authentication portal"
+
+
+def _rerank_corpus() -> tuple[SampleDocument, SampleDocument]:
+    release_note = sample_document(
+        KC_HELP + "release-notes-saml-portal-rerank",
+        "Release Notes",
+        ["Configure SAML authentication portal release."],
+        product="sequence",
+        version="9",
+        doc_type="release-notes",
+    )
+    how_to = sample_document(
+        KC_HELP + "configure-saml-portal-rerank",
+        "Configure SAML",
+        ["Configure SAML portal."],
+        product="sequence",
+        version="9",
+        doc_type="how-to",
+    )
+    return release_note, how_to
+
+
+def test_fake_reranker_order_replaces_the_rrf_order() -> None:
+    release_note, how_to = _rerank_corpus()
+    embedder, store, plain = _seeded_with([release_note, how_to])
+    (rn_id,) = release_note.chunk_ids
+    (how_to_id,) = how_to.chunk_ids
+    assert [r.chunk_id for r in asyncio.run(plain.search(RERANK_QUERY, k=10))] == [
+        rn_id,
+        how_to_id,
+    ]  # precondition: RRF puts the release note first
+
+    reranked = create_hybrid_retriever(
+        embedder, store, _settings(), reranker=FakeReranker({how_to_id: 3.0, rn_id: 1.0})
+    )
+    results = asyncio.run(reranked.search(RERANK_QUERY, k=10))
+
+    assert [(r.chunk_id, r.score) for r in results] == [(how_to_id, 3.0), (rn_id, 1.0)]
+    assert results[1].url == release_note.url  # metadata kept from the index
+
+
+def test_release_notes_weight_applies_to_the_fake_reranker_scores() -> None:
+    release_note, how_to = _rerank_corpus()
+    embedder, store, _ = _seeded_with([release_note, how_to])
+    (rn_id,) = release_note.chunk_ids
+    (how_to_id,) = how_to.chunk_ids
+    mapping = {rn_id: 3.0, how_to_id: 2.0}
+
+    full = create_hybrid_retriever(embedder, store, _settings(), reranker=FakeReranker(mapping))
+    reduced = create_hybrid_retriever(
+        embedder, store, _settings(release_notes_weight=0.5), reranker=FakeReranker(mapping)
+    )
+
+    before = asyncio.run(full.search(RERANK_QUERY, k=10))
+    assert [(r.chunk_id, r.score) for r in before] == [(rn_id, 3.0), (how_to_id, 2.0)]
+    # 3.0 * 0.5 = 1.5 < 2.0: weighted once, in the reranker score space.
+    after = asyncio.run(reduced.search(RERANK_QUERY, k=10))
+    assert [(r.chunk_id, r.score) for r in after] == [(how_to_id, 2.0), (rn_id, 1.5)]
