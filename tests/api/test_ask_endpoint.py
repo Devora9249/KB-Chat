@@ -8,12 +8,16 @@ from fastapi.testclient import TestClient
 
 from contracts.generation import Answer, AskRequest
 from kc.api.app import create_app
-from kc.api.dependencies import get_answerer
+from kc.api.dependencies import get_answerer, get_settings
+from kc.api.settings import ApiSettings
 
 
 @pytest.fixture
 def app() -> FastAPI:
-    return create_app()
+    app = create_app()
+    # Default settings, ignoring a developer's local .env (e.g. API_ANSWERER=rag).
+    app.dependency_overrides[get_settings] = lambda: ApiSettings(_env_file=None)
+    return app
 
 
 @pytest.fixture
