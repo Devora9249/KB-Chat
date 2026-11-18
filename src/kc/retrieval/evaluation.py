@@ -40,6 +40,8 @@ from kc.indexing.testing import SampleDocument, sample_document, seed_index
 from kc.retrieval.hybrid_retriever import (
     DEFAULT_CANDIDATE_K,
     DEFAULT_RELEASE_NOTES_WEIGHT,
+    DEFAULT_RERANK_CANDIDATES,
+    DEFAULT_RERANK_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
 )
 from kc.retrieval.settings import RetrievalSettings, create_hybrid_retriever
@@ -113,6 +115,9 @@ async def create_evaluation_retriever(cases: Sequence[EvalCase]) -> Retriever:
         "RETRIEVAL_CANDIDATE_K": DEFAULT_CANDIDATE_K,
         "RETRIEVAL_TIMEOUT_S": DEFAULT_TIMEOUT_S,
         "RETRIEVAL_RELEASE_NOTES_WEIGHT": DEFAULT_RELEASE_NOTES_WEIGHT,
+        # No reranker is passed; set explicitly anyway so the environment cannot break us.
+        "RETRIEVAL_RERANK_CANDIDATES": DEFAULT_RERANK_CANDIDATES,
+        "RETRIEVAL_RERANK_TIMEOUT_S": DEFAULT_RERANK_TIMEOUT_S,
     }
     settings = RetrievalSettings(_env_file=None, **values)  # type: ignore[call-arg]
     retriever = create_hybrid_retriever(embedder, store, settings)

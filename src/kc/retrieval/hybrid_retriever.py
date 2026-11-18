@@ -1,19 +1,24 @@
-"""Hybrid retriever: vector search + full-text search, fused with RRF.
+"""Hybrid retriever: vector search + full-text search, fused with RRF, optionally reranked.
 
-Depends only on the shared contracts (`Embedder`, `SearchIndex`); the real or fake
-implementations are injected by the caller.
+Depends only on the shared contracts (`Embedder`, `SearchIndex`) and the internal
+`Reranker` protocol; the real or fake implementations are injected by the caller.
 """
 
 import asyncio
+import logging
 import math
 import re
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from typing import Final, NoReturn
 
 from contracts.common import DocType
 from contracts.retrieval import Filters, RetrievalError, SearchResult
 from contracts.storage import Embedder, EmbeddingError, IndexStoreError, SearchIndex
+from kc.retrieval.reranker import Reranker, RerankError
 from kc.retrieval.rrf import reciprocal_rank_fusion
+
+logger = logging.getLogger(__name__)
 
 # Defaults; RetrievalSettings (kc.retrieval.settings) reads the configured values from the
 # environment and uses these when a variable is not set.
@@ -22,6 +27,10 @@ DEFAULT_TIMEOUT_S: Final = 10.0
 # Multiplier for the fused score of release notes (1.0 = no down-weighting). To be tuned
 # with evaluation metrics; no value below 1.0 has been chosen yet.
 DEFAULT_RELEASE_NOTES_WEIGHT: Final = 1.0
+# How many of the top fused results are sent to the reranker (at least k), and its own
+# time budget (separate from timeout_s). Used only when a reranker is configured.
+DEFAULT_RERANK_CANDIDATES: Final = 20
+DEFAULT_RERANK_TIMEOUT_S: Final = 3.0
 _RELEASE_NOTES: Final[DocType] = "release-notes"
 _RRF_K: Final = 60
 # Same tokenization as FakeRetriever and InMemoryIndexStore.text_search.
@@ -92,11 +101,11 @@ def _check_positive_int(value: int, name: str) -> None:
         raise ValueError(f"{name} must be >= 1, got {value}")
 
 
-def _check_timeout_s(timeout_s: float) -> None:
+def _check_timeout_s(timeout_s: float, name: str = "timeout_s") -> None:
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, int | float):
-        raise TypeError(f"timeout_s must be an int or float, got {type(timeout_s).__name__}")
+        raise TypeError(f"{name} must be an int or float, got {type(timeout_s).__name__}")
     if not math.isfinite(timeout_s) or timeout_s <= 0:
-        raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s}")
+        raise ValueError(f"{name} must be finite and > 0, got {timeout_s}")
 
 
 def _check_release_notes_weight(weight: float) -> None:
@@ -116,14 +125,56 @@ def _weight_release_notes(results: list[SearchResult], weight: float) -> list[Se
     """
     if weight == 1.0:
         return results
-    # model_copy(update=...) skips SearchResult validation. Safe here: the RRF score is a
-    # positive finite float and `weight` was validated as finite in (0, 1], so the product
-    # is finite too.
+    # model_copy(update=...) skips SearchResult validation. Safe here: the score is a
+    # finite number >= 0 (an RRF score, or a reranker score already checked by
+    # _check_rerank_output) and `weight` was validated as finite in (0, 1], so the product
+    # is finite and >= 0 too.
     weighted = [
         r.model_copy(update={"score": r.score * weight}) if r.doc_type == _RELEASE_NOTES else r
         for r in results
     ]
     return sorted(weighted, key=lambda r: (-r.score, r.chunk_id))
+
+
+def _check_rerank_output(pool: Sequence[SearchResult], reranked: Sequence[SearchResult]) -> None:
+    """Raise ValueError if `reranked` breaks the Reranker protocol for this `pool`.
+
+    The reranker is called with k=len(pool) and the pool has unique ids, so its output
+    must be a full permutation of the pool, with finite scores >= 0. A violation is a
+    reranker bug: it is raised, never turned into a fallback. The order is not checked
+    (the caller re-sorts after weighting); the other fields are trusted (protocol).
+    """
+    ids = [r.chunk_id for r in reranked]
+    if len(ids) != len(pool):
+        raise ValueError(f"reranker returned {len(ids)} results for {len(pool)} candidates")
+    duplicates = sorted(i for i, count in Counter(ids).items() if count > 1)
+    if duplicates:
+        raise ValueError(f"reranker returned duplicate chunk_ids: {duplicates}")
+    expected = {r.chunk_id for r in pool}
+    if set(ids) != expected:
+        missing = sorted(expected - set(ids))
+        extra = sorted(set(ids) - expected)
+        raise ValueError(
+            f"reranker output does not match the candidates: missing {missing}, extra {extra}"
+        )
+    for result in reranked:
+        score: object = result.score  # model_copy(update=...) can store anything here
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise ValueError(
+                f"reranker score for {result.chunk_id!r} must be a number, "
+                f"got {type(score).__name__}"
+            )
+        try:
+            finite = math.isfinite(score)
+        except OverflowError:  # an int too large for a float, e.g. 10**400
+            raise ValueError(
+                f"reranker score for {result.chunk_id!r} must be finite, "
+                "got an int too large for a float"
+            ) from None
+        if not finite:
+            raise ValueError(f"reranker score for {result.chunk_id!r} must be finite, got {score}")
+        if score < 0:
+            raise ValueError(f"reranker score for {result.chunk_id!r} must be >= 0, got {score}")
 
 
 class HybridRetriever:
@@ -141,14 +192,23 @@ class HybridRetriever:
             (the real request is max(candidate_k, k)).
         timeout_s: time budget for one search call, in seconds; when it expires both
             branches are cancelled (see `search` for why the real wait can be longer).
-        release_notes_weight: multiplier for the fused score of results with
-            doc_type "release-notes", in (0, 1]; 1.0 (the default) changes nothing.
+        release_notes_weight: multiplier for the score of results with doc_type
+            "release-notes", in (0, 1]; 1.0 (the default) changes nothing. Applied to the
+            fused RRF score and, when reranking succeeds, to the reranker score.
+        reranker: optional; None (the default) keeps the RRF ranking exactly as before.
+        rerank_candidates: how many of the top weighted RRF results are sent to the
+            reranker (the real number is max(rerank_candidates, k), capped by how many
+            results there are). Validated even when no reranker is set.
+        rerank_timeout_s: the reranker's own time budget in seconds, separate from
+            `timeout_s`; when it expires, search falls back to the RRF ranking.
 
     Raises:
-        TypeError: `candidate_k` is not an int, or `timeout_s` / `release_notes_weight`
-            is not an int or float (bool is rejected for all three).
-        ValueError: `candidate_k` < 1, `timeout_s` is not finite or is <= 0, or
-            `release_notes_weight` is not finite or not in (0, 1].
+        TypeError: `candidate_k` / `rerank_candidates` is not an int, or `timeout_s` /
+            `release_notes_weight` / `rerank_timeout_s` is not an int or float (bool is
+            rejected for all of them).
+        ValueError: `candidate_k` / `rerank_candidates` < 1, `timeout_s` /
+            `rerank_timeout_s` is not finite or is <= 0, or `release_notes_weight` is not
+            finite or not in (0, 1].
     """
 
     def __init__(
@@ -159,15 +219,23 @@ class HybridRetriever:
         candidate_k: int = DEFAULT_CANDIDATE_K,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         release_notes_weight: float = DEFAULT_RELEASE_NOTES_WEIGHT,
+        reranker: Reranker | None = None,
+        rerank_candidates: int = DEFAULT_RERANK_CANDIDATES,
+        rerank_timeout_s: float = DEFAULT_RERANK_TIMEOUT_S,
     ) -> None:
         _check_positive_int(candidate_k, "candidate_k")
         _check_timeout_s(timeout_s)
         _check_release_notes_weight(release_notes_weight)
+        _check_positive_int(rerank_candidates, "rerank_candidates")
+        _check_timeout_s(rerank_timeout_s, "rerank_timeout_s")
         self._embedder = embedder
         self._index = index
         self._candidate_k = candidate_k
         self._timeout_s = timeout_s
         self._release_notes_weight = release_notes_weight
+        self._reranker = reranker
+        self._rerank_candidates = rerank_candidates
+        self._rerank_timeout_s = rerank_timeout_s
 
     async def search(
         self, query: str, filters: Filters | None = None, k: int = 5
@@ -185,14 +253,30 @@ class HybridRetriever:
         4. Fuse both lists with RRF (rank-based).
         5. Multiply the score of release notes by `release_notes_weight` and re-sort
            (score descending, ties by chunk_id); skipped when the weight is 1.0.
-           The returned `score` is then the weighted RRF score.
-        6. Return the first `k` (cut AFTER weighting, so a result below `k` can move up).
+           Without a reranker, the returned `score` is this weighted RRF score.
+        6. Only when a reranker is configured and step 5 gave any result: send the top
+           max(rerank_candidates, k) of that list to `reranker.rerank(..., k=len(pool))`
+           under its own budget `rerank_timeout_s`; check the output (a full permutation
+           of the pool, scores finite and >= 0, else ValueError); apply the release-notes
+           weight ONCE MORE, now to the reranker scores, and re-sort. The returned `score`
+           is then the weighted reranker score. The two weightings are in different score
+           spaces (the reranker replaces the RRF score, never reuses it), so each returned
+           score is weighted exactly once.
+           Fallback: if the reranker raises RerankError or TimeoutError (including its own
+            budget expiring), a warning is logged with only the error type and the pool
+            size (no query text, no exception details), and the result of step 5 is used,
+            exactly as if no reranker were configured.
+        7. Return the first `k` (cut AFTER weighting, so a result below `k` can move up).
 
         One time budget (`timeout_s`) covers both branches; checks 1-2 run before it.
         `timeout_s` is when both branches are CANCELLED, not a hard limit on the wait:
         `search` returns only after the cancelled work has actually finished, so if a
         dependency ignores cancellation (or keeps running in a thread that cancellation
-        cannot stop), the real wait can be longer than `timeout_s`.
+        cannot stop), the real wait can be longer than `timeout_s`. Reranking has its own
+        budget after that, so the worst case is about `timeout_s + rerank_timeout_s`. The
+        same caveat applies: a reranker that blocks the event loop (synchronous work
+        without a thread) cannot be stopped by its budget, and one that swallows the
+        cancellation and returns a result has that result used.
 
         Errors (contract: RetrievalError):
         - Infrastructure failures (EmbeddingError, IndexStoreError, any TimeoutError,
@@ -206,9 +290,13 @@ class HybridRetriever:
           `raise ... from ...`, `__suppress_context__` stays True, so a printed traceback
           shows the cause and not the group, although the group is still reachable via
           `__context__`.
+        - Reranker: only RerankError and TimeoutError lead to the fallback. Any other
+          error (ValueError, TypeError, an ExceptionGroup even if it holds a RerankError)
+          is raised unchanged; an invalid reranker output raises ValueError.
         - asyncio.CancelledError is never converted. External cancellation always ends
           in CancelledError, even if a branch failed at the same time (that error is
-          then kept in the CancelledError's `__cause__`).
+          then kept in the CancelledError's `__cause__`), and also during reranking
+          (never a fallback).
         When a branch fails, the TaskGroup cancels the other one and waits for it, so no
         task is left running after `search` returns or raises.
 
@@ -250,7 +338,38 @@ class HybridRetriever:
             raise
 
         fused = reciprocal_rank_fusion(vector_results, text_results, rrf_k=_RRF_K)
-        return _weight_release_notes(fused, self._release_notes_weight)[:k]
+        ranked = _weight_release_notes(fused, self._release_notes_weight)  # RRF score space
+        return await self._rerank(query, ranked, k)
+
+    async def _rerank(self, query: str, ranked: list[SearchResult], k: int) -> list[SearchResult]:
+        """Step 6 of `search`: optional reranking with fallback; returns the final top k."""
+        if self._reranker is None or not ranked:
+            return ranked[:k]  # exactly the behaviour without a reranker
+        pool = ranked[: max(self._rerank_candidates, k)]
+        try:
+            # asyncio.timeout turns only ITS OWN cancellation into TimeoutError; an
+            # external cancel stays CancelledError (not caught here: never a fallback).
+            async with asyncio.timeout(self._rerank_timeout_s):
+                reranked = await self._reranker.rerank(query, pool, k=len(pool))
+        except (RerankError, TimeoutError) as exc:
+            # Only the error TYPE and the pool size: no query text (user content) and no
+            # exception message or traceback (a provider error may echo the request).
+            logger.warning(
+                "reranker failed (%s); falling back to the RRF ranking for %d candidates",
+                type(exc).__name__,
+                len(pool),
+            )
+            return ranked[:k]
+        _check_rerank_output(pool, reranked)
+        # SearchResult.score is a float; model_copy(update=...) can carry a valid int score
+        # through unchanged, so convert it (finite, already checked). Other fields are kept.
+        as_float = [
+            r if isinstance(r.score, float) else r.model_copy(update={"score": float(r.score)})
+            for r in reranked
+        ]
+        # Reranker score space: the weight is applied once more, to the NEW scores.
+        final = _weight_release_notes(as_float, self._release_notes_weight)
+        return sorted(final, key=lambda r: (-r.score, r.chunk_id))[:k]
 
     async def _run_branches(
         self, query: str, filters: Filters | None, n: int

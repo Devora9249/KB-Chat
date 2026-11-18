@@ -8,9 +8,12 @@ from pydantic import ValidationError
 
 from contracts.retrieval import Filters, Retriever, SearchResult
 from contracts.storage import InputType
+from kc.retrieval.fake_reranker import FakeReranker
 from kc.retrieval.hybrid_retriever import (
     DEFAULT_CANDIDATE_K,
     DEFAULT_RELEASE_NOTES_WEIGHT,
+    DEFAULT_RERANK_CANDIDATES,
+    DEFAULT_RERANK_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
 )
 from kc.retrieval.settings import (
@@ -19,7 +22,13 @@ from kc.retrieval.settings import (
     load_retrieval_settings,
 )
 
-ENV_NAMES = ("RETRIEVAL_CANDIDATE_K", "RETRIEVAL_TIMEOUT_S", "RETRIEVAL_RELEASE_NOTES_WEIGHT")
+ENV_NAMES = (
+    "RETRIEVAL_CANDIDATE_K",
+    "RETRIEVAL_TIMEOUT_S",
+    "RETRIEVAL_RELEASE_NOTES_WEIGHT",
+    "RETRIEVAL_RERANK_CANDIDATES",
+    "RETRIEVAL_RERANK_TIMEOUT_S",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +51,8 @@ def test_defaults_come_from_hybrid_retriever() -> None:
     assert settings.candidate_k == DEFAULT_CANDIDATE_K == 50
     assert settings.timeout_s == DEFAULT_TIMEOUT_S == 10.0
     assert settings.release_notes_weight == DEFAULT_RELEASE_NOTES_WEIGHT == 1.0
+    assert settings.rerank_candidates == DEFAULT_RERANK_CANDIDATES == 20
+    assert settings.rerank_timeout_s == DEFAULT_RERANK_TIMEOUT_S == 3.0
 
 
 def test_reads_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -163,6 +174,45 @@ def test_release_notes_weight_bool_is_rejected(value: bool) -> None:
         RetrievalSettings(_env_file=None, RETRIEVAL_RELEASE_NOTES_WEIGHT=value)  # type: ignore[call-arg]
 
 
+def test_rerank_settings_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETRIEVAL_RERANK_CANDIDATES", "30")
+    monkeypatch.setenv("RETRIEVAL_RERANK_TIMEOUT_S", "1")
+    settings = _load()
+    assert settings.rerank_candidates == 30
+    assert settings.rerank_timeout_s == 1.0
+    assert isinstance(settings.rerank_timeout_s, float)
+
+
+@pytest.mark.parametrize("value", ["abc", "5.0", "5.5", "true", "", "0", "-1"])
+def test_rerank_candidates_invalid_value_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RETRIEVAL_RERANK_CANDIDATES", value)
+    with pytest.raises(ValidationError, match="RETRIEVAL_RERANK_CANDIDATES"):
+        _load()
+
+
+@pytest.mark.parametrize("value", [True, False, 5.0, 5.5])
+def test_rerank_candidates_bool_or_float_is_rejected(value: Any) -> None:
+    with pytest.raises(ValidationError, match="rerank_candidates must be an int"):
+        RetrievalSettings(_env_file=None, RETRIEVAL_RERANK_CANDIDATES=value)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("value", ["0", "0.0", "-1", "nan", "inf", "-inf", "abc", "true", ""])
+def test_rerank_timeout_s_invalid_value_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("RETRIEVAL_RERANK_TIMEOUT_S", value)
+    with pytest.raises(ValidationError, match="RETRIEVAL_RERANK_TIMEOUT_S"):
+        _load()
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_rerank_timeout_s_bool_is_rejected(value: bool) -> None:
+    with pytest.raises(ValidationError, match="rerank_timeout_s must be a number"):
+        RetrievalSettings(_env_file=None, RETRIEVAL_RERANK_TIMEOUT_S=value)  # type: ignore[call-arg]
+
+
 # --- factory -----------------------------------------------------------------------------
 
 
@@ -217,3 +267,26 @@ def test_factory_passes_the_release_notes_weight(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("RETRIEVAL_RELEASE_NOTES_WEIGHT", "0.25")
     retriever = create_hybrid_retriever(_Embedder(), _Index(), _load())
     assert retriever._release_notes_weight == 0.25
+
+
+def test_factory_without_a_reranker_keeps_the_default_none() -> None:
+    retriever = create_hybrid_retriever(_Embedder(), _Index(), _load())
+    assert retriever._reranker is None
+    assert retriever._rerank_candidates == DEFAULT_RERANK_CANDIDATES
+    assert retriever._rerank_timeout_s == DEFAULT_RERANK_TIMEOUT_S
+
+
+def test_factory_passes_the_reranker_and_rerank_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETRIEVAL_RERANK_CANDIDATES", "8")
+    monkeypatch.setenv("RETRIEVAL_RERANK_TIMEOUT_S", "0.5")
+    reranker = FakeReranker()
+    retriever = create_hybrid_retriever(_Embedder(), _Index(), _load(), reranker=reranker)
+    assert retriever._reranker is reranker
+    assert retriever._rerank_candidates == 8
+    assert retriever._rerank_timeout_s == 0.5
+
+
+def test_factory_reranker_is_keyword_only() -> None:
+    untyped: Any = create_hybrid_retriever  # mypy already rejects this call; check at runtime
+    with pytest.raises(TypeError):
+        untyped(_Embedder(), _Index(), _load(), FakeReranker())
