@@ -5,10 +5,13 @@ determinism only. They never assert ranking quality (FakeEmbedder is not semanti
 """
 
 import asyncio
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from contracts.common import Product
 from contracts.evaluation import EvalCase
 from contracts.retrieval import Filters, Retriever, SearchResult
 from eval.golden_set import load_golden_set
@@ -28,8 +31,10 @@ def _case(question: str, urls: list[str], product: str | None = "sequence") -> E
     return EvalCase(question=question, expected_urls=urls, product=product, reference_answer=None)
 
 
-def _build(cases: list[EvalCase]) -> SyntheticEvaluationRetriever:
-    retriever = asyncio.run(create_evaluation_retriever(cases))
+def _build(
+    cases: list[EvalCase], url_products: Mapping[str, str] | None = None
+) -> SyntheticEvaluationRetriever:
+    retriever = asyncio.run(create_evaluation_retriever(cases, url_products=url_products))
     assert isinstance(retriever, SyntheticEvaluationRetriever)
     return retriever
 
@@ -238,6 +243,161 @@ def test_one_valid_and_one_invalid_product_for_a_url_raises_value_error() -> Non
 def test_url_that_is_not_a_kc_article_raises_value_error() -> None:
     with pytest.raises(ValueError, match="Knowledge Center article"):
         _build([_case("Question", ["https://example.com/help/saml"])])
+
+
+# --- explicit URL -> Product mapping (url_products) ----------------------------------------
+
+SAML_ACROSS_PRODUCTS = [
+    _case("SAML in SeQuence", [SAML], product="sequence"),
+    _case("SAML in Orchestration", [SAML], product="orchestration"),
+]
+
+
+def test_mapping_resolves_a_url_shared_by_cases_of_different_products() -> None:
+    retriever = _build(SAML_ACROSS_PRODUCTS, url_products={SAML: "orchestration"})
+
+    (document,) = retriever._documents
+    assert document.product == "orchestration"
+    assert document.chunk_texts == ("SAML in SeQuence", "SAML in Orchestration")
+    assert {r.product for r in _search(retriever, "SAML", k=10)} == {"orchestration"}
+
+
+def test_without_a_mapping_the_same_cases_still_conflict() -> None:
+    with pytest.raises(ValueError, match="conflicting products"):
+        _build(SAML_ACROSS_PRODUCTS)
+
+
+def test_mapping_takes_precedence_over_the_case_product() -> None:
+    case = _case("How do I configure SAML?", [SAML], product="sequence")
+    retriever = _build([case], url_products={SAML: "case-manager"})
+
+    (document,) = retriever._documents
+    assert document.product == "case-manager"
+    assert case.product == "sequence"  # the EvalCase itself is not changed
+
+
+def test_mapping_gives_each_url_of_a_case_its_own_product() -> None:
+    # Values deliberately differ from _FALLBACK_PRODUCTS (sequence / orchestration for these
+    # URLs), so only the explicit mapping can produce them.
+    case = _case("What is the Job Execution Service?", [JES_SEQUENCE, JES_ORCHESTRATION], None)
+    mapping = {JES_SEQUENCE: "opsmanager", JES_ORCHESTRATION: "case-manager"}
+    retriever = _build([case], url_products=mapping)
+
+    assert [(d.url, d.product) for d in retriever._documents] == [
+        (JES_SEQUENCE, "opsmanager"),
+        (JES_ORCHESTRATION, "case-manager"),
+    ]
+    expected: list[tuple[Product, str]] = [
+        ("opsmanager", JES_SEQUENCE),
+        ("case-manager", JES_ORCHESTRATION),
+    ]
+    for product, url in expected:
+        found = _search(retriever, "Job Execution Service", Filters(products=[product]), k=10)
+        assert [(r.url, r.product) for r in found] == [(url, product)]
+
+
+@pytest.mark.parametrize("case_product", ["Sequence", "seQuence 9", "", "cora"])
+def test_mapping_ignores_an_invalid_case_product(case_product: str) -> None:
+    # Intentional: with url_products, EvalCase.product is not read at all (not validated).
+    case = _case("How do I configure SAML?", [SAML], product=case_product)
+    retriever = _build([case], url_products={SAML: "sequence"})
+
+    (document,) = retriever._documents
+    assert document.product == "sequence"
+    assert case.product == case_product  # the EvalCase itself is not changed
+
+
+def test_mapping_ignores_the_fallback_and_reports_all_missing_urls() -> None:
+    # JES_SEQUENCE and EMAIL are in _FALLBACK_PRODUCTS; with a mapping it is not consulted.
+    cases = [
+        _case("What is JES?", [JES_SEQUENCE], product=None),
+        _case("How do I configure SAML?", [SAML]),
+        _case("Emails are not sent", [EMAIL], product=None),
+    ]
+    with pytest.raises(ValueError, match="no product for 2 URL") as error:
+        _build(cases, url_products={SAML: "sequence"})
+    message = str(error.value)
+    assert JES_SEQUENCE in message
+    assert EMAIL in message
+    assert message.index(JES_SEQUENCE) < message.index(EMAIL)  # first-seen order
+
+
+def test_empty_mapping_with_positive_cases_reports_the_missing_urls() -> None:
+    with pytest.raises(ValueError, match="no product for 1 URL") as error:
+        _build([_case("How do I configure SAML?", [SAML])], url_products={})
+    assert SAML in str(error.value)
+
+
+@pytest.mark.parametrize("cases", [[], [_case("How do I bake a cake?", [], product=None)]])
+def test_empty_mapping_without_positive_cases_gives_an_empty_retriever(
+    cases: list[EvalCase],
+) -> None:
+    retriever = _build(cases, url_products={})
+    assert retriever._documents == ()
+    assert _search(retriever, "How do I configure SAML?") == []
+
+
+@pytest.mark.parametrize("product", ["Sequence", "seQuence 9", "", "cora"])
+@pytest.mark.parametrize("used", [True, False])
+def test_invalid_product_in_the_mapping_raises_value_error(product: str, used: bool) -> None:
+    # Every entry is checked, including one for a URL that no case uses.
+    mapping = {SAML: product} if used else {SAML: "sequence", KAFKA: product}
+    with pytest.raises(ValueError, match="invalid product"):
+        _build([_case("How do I configure SAML?", [SAML])], url_products=mapping)
+
+
+@pytest.mark.parametrize(
+    ("mapping", "error", "match"),
+    [
+        ({"": "sequence"}, ValueError, "empty URL key"),
+        ({"   ": "sequence"}, ValueError, "empty URL key"),
+        ({1: "sequence"}, TypeError, "keys must be str"),
+        ({KAFKA: None}, TypeError, "value for .* must be str"),
+    ],
+)
+def test_invalid_mapping_entry_raises(
+    mapping: dict[Any, Any], error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        _build(
+            [_case("How do I configure SAML?", [SAML])], url_products={SAML: "sequence", **mapping}
+        )
+
+
+def test_unused_mapping_entries_are_ignored() -> None:
+    mapping = {KAFKA: "orchestration", SAML: "sequence", EMAIL: "opsmanager"}
+    retriever = _build([_case("How do I configure SAML?", [SAML])], url_products=mapping)
+    assert [(d.url, d.product) for d in retriever._documents] == [(SAML, "sequence")]
+
+
+def test_mapping_is_not_mutated_and_later_changes_have_no_effect() -> None:
+    mapping = {SAML: "sequence", KAFKA: "orchestration"}
+    before = dict(mapping)
+    retriever = _build([_case("How do I configure SAML?", [SAML])], url_products=mapping)
+    assert mapping == before
+
+    mapping[SAML] = "opsmanager"
+    (document,) = retriever._documents
+    assert document.product == "sequence"
+    assert {r.product for r in _search(retriever, "configure SAML")} == {"sequence"}
+
+
+def test_url_products_is_keyword_only() -> None:
+    factory: Any = create_evaluation_retriever
+    with pytest.raises(TypeError, match="positional"):
+        asyncio.run(factory([_case("How do I configure SAML?", [SAML])], {SAML: "sequence"}))
+
+
+def test_repeated_construction_with_a_mapping_is_deterministic() -> None:
+    cases = [*SAML_ACROSS_PRODUCTS, _case("Configure Kafka", [KAFKA], product="sequence")]
+    mapping = {SAML: "sequence", KAFKA: "orchestration"}
+
+    first, second = _build(cases, mapping), _build(cases, mapping)
+
+    assert first._documents == second._documents
+    assert [d.chunk_ids for d in first._documents] == [d.chunk_ids for d in second._documents]
+    for query in ["SAML", "Kafka", "שאלה בעברית"]:
+        assert _search(first, query, k=10) == _search(second, query, k=10)
 
 
 # --- determinism ---------------------------------------------------------------------------

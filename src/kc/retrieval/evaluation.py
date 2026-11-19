@@ -23,12 +23,18 @@ Synthetic corpus (deterministic, no I/O besides the in-memory index):
   twice in the same case still gives one chunk);
 - negative cases (`expected_urls=[]`) add nothing; no cases -> a valid, empty index;
 - every document: doc_type="other", version=None, title derived from the URL slug;
-- product: the non-None `EvalCase.product` values of the cases that point to the URL
-  (must be one valid `Product`); only when none exists, `_FALLBACK_PRODUCTS` (explicit,
-  agreed mapping). Conflicting, invalid or unresolvable products raise ValueError.
+- product, with `url_products` (the explicit URL -> Product mapping owned by Evaluation):
+  the mapping ALONE decides; `EvalCase.product` and `_FALLBACK_PRODUCTS` are ignored, so
+  a URL shared by questions about different products is fine. Every URL used by the
+  cases must be in the mapping (ValueError listing all missing URLs); entries for unused
+  URLs are ignored; every entry must have a valid `Product` value;
+- product, without `url_products`: the non-None `EvalCase.product` values of the cases
+  that point to the URL (must be one valid `Product`); only when none exists,
+  `_FALLBACK_PRODUCTS` (explicit, agreed mapping). Conflicting, invalid or unresolvable
+  products raise ValueError.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, TypeGuard, get_args
 
 from contracts.common import Product
@@ -97,17 +103,27 @@ class SyntheticEvaluationRetriever:
         return await self._retriever.search(query, filters, k)
 
 
-async def create_evaluation_retriever(cases: Sequence[EvalCase]) -> Retriever:
+async def create_evaluation_retriever(
+    cases: Sequence[EvalCase],
+    *,
+    url_products: Mapping[str, str] | None = None,
+) -> Retriever:
     """Build a synthetic smoke-test retriever from `cases` (see the module docstring).
 
     The result is a `SyntheticEvaluationRetriever`: `is_synthetic` is True and its scores
     are NOT retrieval-quality measurements. Async on purpose: it is awaited inside the
     runner's event loop (no asyncio.run here).
 
-    Raises ValueError for a URL with conflicting, invalid or unresolvable products, or a
-    URL that is not a Knowledge Center article URL (from `sample_document`).
+    `url_products` (keyword-only, optional): full article URL -> Product. When given, it
+    is the only source of each document's product (see the module docstring). It is
+    copied, never modified. None keeps the case-based resolution.
+
+    Raises ValueError for a URL with conflicting, invalid or unresolvable products, a used
+    URL missing from `url_products`, an invalid `url_products` entry, or a URL that is not
+    a Knowledge Center article URL (from `sample_document`); TypeError for a
+    `url_products` key or value that is not a string.
     """
-    documents = _build_documents(cases)
+    documents = _build_documents(cases, url_products)
 
     embedder = FakeEmbedder()
     store = InMemoryIndexStore(dimension=embedder.dimension, model_name=embedder.model_name)
@@ -130,7 +146,9 @@ async def create_evaluation_retriever(cases: Sequence[EvalCase]) -> Retriever:
     return SyntheticEvaluationRetriever(retriever, documents)
 
 
-def _build_documents(cases: Sequence[EvalCase]) -> list[SampleDocument]:
+def _build_documents(
+    cases: Sequence[EvalCase], url_products: Mapping[str, str] | None
+) -> list[SampleDocument]:
     questions: dict[str, list[str]] = {}  # url -> chunk texts; dict keeps first-seen order
     products: dict[str, set[str]] = {}  # url -> non-None products of the cases
     for case in cases:
@@ -140,17 +158,52 @@ def _build_documents(cases: Sequence[EvalCase]) -> list[SampleDocument]:
             if case.product is not None:
                 seen.add(case.product)
 
+    if url_products is None:
+        resolved = {url: _resolve_product(url, products[url]) for url in questions}
+    else:
+        resolved = _products_from_mapping(list(questions), url_products)
+
     return [
         sample_document(
             url,
             _title(url),
             texts,
-            product=_resolve_product(url, products[url]),
+            product=resolved[url],
             version=None,
             doc_type="other",
         )
         for url, texts in questions.items()
     ]
+
+
+def _products_from_mapping(urls: list[str], url_products: Mapping[str, str]) -> dict[str, Product]:
+    """Product of each used URL, from the explicit mapping only (cases are not consulted)."""
+    mapping = _validate_url_products(url_products)
+    missing = [url for url in urls if url not in mapping]
+    if missing:
+        raise ValueError(f"url_products has no product for {len(missing)} URL(s): {missing}")
+    return {url: mapping[url] for url in urls}
+
+
+def _validate_url_products(url_products: Mapping[str, str]) -> dict[str, Product]:
+    """Copy of the mapping with every entry checked (used or not), in its own order."""
+    mapping: dict[str, Product] = {}
+    for url, product in dict(url_products).items():
+        if not isinstance(url, str):
+            raise TypeError(f"url_products keys must be str, got {type(url).__name__}")
+        if not url.strip():
+            raise ValueError("url_products has an empty URL key")
+        if not isinstance(product, str):
+            raise TypeError(
+                f"url_products value for {url!r} must be str, got {type(product).__name__}"
+            )
+        if not _is_product(product):
+            raise ValueError(
+                f"invalid product {product!r} for {url!r} in url_products; "
+                f"expected one of {sorted(_PRODUCTS)}"
+            )
+        mapping[url] = product
+    return mapping
 
 
 def _resolve_product(url: str, products: set[str]) -> Product:
