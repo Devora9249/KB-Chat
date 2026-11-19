@@ -118,6 +118,44 @@
   filter: brightness(0.95);
 }
 
+/* ---- Hidden scrollbars (scrolling itself still works: wheel, touchpad, touch, keyboard) ----
+ * No `overflow: hidden` here: that would disable scrolling. The page and the chat scroll
+ * container keep their overflow; only the visible bar is removed.
+ * `.overflow-y-auto` / `.overflow-auto` are the Tailwind classes Chainlit puts on its scroll
+ * containers; `[data-radix-scroll-area-viewport]` is the Radix scroll-area viewport.
+ */
+html,
+body,
+.overflow-y-auto,
+.overflow-auto,
+[data-radix-scroll-area-viewport] {
+  scrollbar-width: none; /* Firefox and the standard property */
+  -ms-overflow-style: none; /* legacy Edge / IE */
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+.overflow-y-auto::-webkit-scrollbar,
+.overflow-auto::-webkit-scrollbar,
+[data-radix-scroll-area-viewport]::-webkit-scrollbar {
+  display: none; /* Chrome, Edge, Safari */
+  width: 0;
+}
+
+/* Catch-all: the rules above did not reach the element that shows the bar, so hide it on
+ * every element. Still no `overflow: hidden`: scrolling keeps working.
+ */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 /* ---- Hebrew / mixed-direction text ----
  * `unicode-bidi: plaintext` picks each paragraph's direction from its first strong
  * character, so a Hebrew message is right-to-left and an English one left-to-right.
