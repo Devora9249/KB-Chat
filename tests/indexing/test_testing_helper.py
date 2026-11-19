@@ -171,6 +171,54 @@ def test_embedding_errors_are_not_swallowed() -> None:
         asyncio.run(seed_index(store, Broken(dimension=64), [_saml()]))
 
 
+@pytest.mark.parametrize("count", [1, 2, 5])
+def test_one_chunk_id_per_text_in_the_same_order(count: int) -> None:
+    # Racheli relies on chunk_ids[i] being the id of the chunk made from chunk_texts[i].
+    texts = [f"marker{i}word appears only in chunk {i}" for i in range(count)]
+    document = sample_document(
+        BASE + "ordered", "Ordered", texts, product="sequence", doc_type="how-to"
+    )
+
+    assert len(document.chunk_ids) == len(texts) == count
+    assert document.chunk_texts == tuple(texts)
+    assert len(set(document.chunk_ids)) == count  # all distinct
+
+    store, embedder = _store_and_embedder()
+    asyncio.run(seed_index(store, embedder, [document]))
+    for i, text in enumerate(texts):
+        (found,) = asyncio.run(store.text_search(f"marker{i}word", k=5))
+        assert (found.chunk_id, found.text) == (document.chunk_ids[i], text)
+
+
+def test_title_is_returned_in_search_results_of_both_methods() -> None:
+    # Racheli relies on SearchResult.title being exactly the title given to sample_document.
+    first = sample_document(
+        BASE + "first-page",
+        "Configure SAML: Step 2 (SeQuence 9.x)",
+        ["alpha shared text", "alpha second chunk"],
+        product="sequence",
+        doc_type="how-to",
+    )
+    second = sample_document(
+        BASE + "second-page",
+        "Release Notes — Orchestration 11",
+        ["alpha shared text in the notes"],
+        product="orchestration",
+        doc_type="release-notes",
+    )
+    titles = {first.url: first.title, second.url: second.title}
+    store, embedder = _store_and_embedder()
+    asyncio.run(seed_index(store, embedder, [first, second]))
+
+    (query,) = asyncio.run(embedder.embed(["alpha shared text"], input_type="query"))
+    by_vector = asyncio.run(store.vector_search(query, k=10))
+    by_text = asyncio.run(store.text_search("alpha", k=10))
+
+    for results in (by_vector, by_text):
+        assert len(results) == 3  # every chunk of both documents
+        assert all(result.title == titles[result.url] for result in results)
+
+
 def test_accepts_any_iterable_including_a_generator() -> None:
     store, embedder = _store_and_embedder()
     asyncio.run(seed_index(store, embedder, (d for d in [_saml()])))
