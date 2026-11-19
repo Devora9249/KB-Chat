@@ -67,8 +67,6 @@ def main(
 
 
 if __name__ == "__main__":
-    # Windows defaults piped output to a legacy code page (e.g. cp1252), which crashes on
-    # non-Latin questions. Force UTF-8 for the CLI.
     if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main())
