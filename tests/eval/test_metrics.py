@@ -21,7 +21,7 @@ def test_ranked_unique_urls_keeps_first_occurrence_order() -> None:
         ([A, B, C], [B], True),
         ([A, B, C], [D], False),
         ([], [A], False),
-        ([A], [D, A], True),  
+        ([A], [D, A], True),
     ],
 )
 def test_hit(ranked: list[str], expected: list[str], want: bool) -> None:
